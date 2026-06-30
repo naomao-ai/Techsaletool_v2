@@ -1,0 +1,26 @@
+{
+  "productName": "Business Requirements",
+  "version": "0.1.0",
+  "identifier": "com.business.requirements",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build",
+    "devUrl": "http://localhost:3000",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Business Requirements",
+        "width": 1280,
+        "height": 800,
+        "decorations": true,
+        "resizable": true,
+        "dragDropEnabled": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  }
+}

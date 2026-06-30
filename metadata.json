@@ -1,0 +1,8 @@
+{
+  "name": "요구조건 관리 플랫폼(V.2.2.4.3) - 안정화",
+  "description": "A comprehensive B2B management dashboard for analyzing, tracking, and managing business requirements with robust inline actions, filtering, and real-time statistics.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

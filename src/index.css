@@ -1,0 +1,101 @@
+@import url("https://cdn.jsdelivr.net/gh/orioncactus/pretendard/dist/web/static/pretendard.css");
+@import "tailwindcss";
+
+@theme {
+  --color-brand-primary: #6366f1;
+  --color-brand-on-primary: #ffffff;
+  --color-brand-bg: #020617;
+  --color-brand-surface: #0f172a;
+  --color-brand-surface-low: #090d16;
+  --color-brand-surface-high: #1e293b;
+  --color-brand-surface-highest: #334155;
+  --color-brand-surface-lowest: #020617;
+  --color-brand-outline: #1e293b;
+  --color-brand-outline-variant: #334155;
+  --color-brand-on-surface: #f8fafc;
+  --color-brand-on-surface-variant: #94a3b8;
+  --color-brand-success: #10b981;
+  --color-brand-success-container: #064e3b;
+  --color-brand-error: #f43f5e;
+  --color-brand-error-container: #4c0519;
+  --color-brand-primary-container: #4f46e5;
+  --color-brand-on-error-container: #ffe4e6;
+  --color-brand-tertiary: #c084fc;
+  --color-brand-tertiary-container: #6b21a8;
+
+  --font-sans: "Pretendard", "Inter", "Noto Sans KR", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", Menlo, monospace;
+}
+
+/* Custom Webkit scrollbars for professional spreadsheet look */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: #020617;
+}
+::-webkit-scrollbar-thumb {
+  background: #1e293b;
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #475569;
+}
+
+/* Base body styles */
+body {
+  background-color: var(--color-brand-bg);
+  color: var(--color-brand-on-surface);
+}
+
+:root.light-theme {
+  --color-brand-bg: #ffffff;
+  --color-brand-surface: #ffffff;
+  --color-brand-surface-low: #f8fafc;
+  --color-brand-surface-high: #f1f5f9;
+  --color-brand-surface-highest: #e2e8f0;
+  --color-brand-surface-lowest: #ffffff;
+  --color-brand-outline: #cbd5e1;
+  --color-brand-outline-variant: #e2e8f0;
+  --color-brand-on-surface: #000000;
+  --color-brand-on-surface-variant: #334155;
+}
+
+.spreadsheet-row {
+  --row-bg: var(--color-brand-surface);
+  background-color: var(--row-bg);
+}
+
+.spreadsheet-row:hover {
+  --row-bg: var(--color-brand-surface-high);
+  background-color: var(--row-bg) !important;
+}
+
+.spreadsheet-row.done-row {
+  --row-bg: var(--color-brand-surface-low);
+  background-color: var(--row-bg);
+}
+
+.spreadsheet-row.done-row:hover {
+  --row-bg: var(--color-brand-surface-high);
+  background-color: var(--row-bg) !important;
+}
+
+
+/* Animation presets */
+@keyframes fadeSlideUp {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-fade-slide-up {
+  animation: fadeSlideUp 0.25s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+

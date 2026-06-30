@@ -1,0 +1,110 @@
+2322-                            엑셀에서 복사(Ctrl+C) 후 여기에 붙여넣기(Ctrl+V) 하세요.
+2323-                          </div>
+2324-                        )}
+2325-                        {inflationRatesInput.map((rateObj, idx) => (
+2326-                          <div key={idx} className="grid grid-cols-[2fr_1.5fr_2fr_2fr_30px] gap-1 items-center">
+2327:                            <input 
+2328-                              type="text" placeholder="검색 단어" value={rateObj.word} 
+2329-                              onChange={e => {
+2330-                                const newRates = [...inflationRatesInput];
+2331-                                newRates[idx].word = e.target.value;
+2332-                                setInflationRatesInput(newRates);
+2333-                              }} 
+2334-                              className="w-full px-1.5 py-1 bg-transparent border border-brand-outline-variant/50 rounded focus:ring-1 focus:ring-brand-primary focus:outline-none" 
+2335-                            />
+2336:                            <input 
+2337-                              type="number" placeholder="0.0" value={rateObj.rate} 
+2338-                              onChange={e => {
+2339-                                const newRates = [...inflationRatesInput];
+2340-                                newRates[idx].rate = Number(e.target.value);
+2341-                                setInflationRatesInput(newRates);
+2342-                              }} 
+2343-                              className="w-full px-1.5 py-1 bg-transparent border border-brand-outline-variant/50 rounded focus:ring-1 focus:ring-brand-primary focus:outline-none text-center" 
+2344-                            />
+2345:                            <input 
+2346-                              type="text" placeholder="호선명" value={rateObj.baseShip || ''} 
+2347-                              onChange={e => {
+2348-                                const newRates = [...inflationRatesInput];
+2349-                                newRates[idx].baseShip = e.target.value;
+2350-                                setInflationRatesInput(newRates);
+2351-                              }} 
+2352-                              className="w-full px-1.5 py-1 bg-transparent border border-brand-outline-variant/50 rounded focus:ring-1 focus:ring-brand-primary focus:outline-none" 
+2353-                            />
+2354:                            <input 
+2355-                              type="text" placeholder="비고" value={rateObj.note || ''} 
+2356-                              onChange={e => {
+2357-                                const newRates = [...inflationRatesInput];
+2358-                                newRates[idx].note = e.target.value;
+2359-                                setInflationRatesInput(newRates);
+--
+3679-                              <div className="absolute top-1 right-1 opacity-70" title={`${lockedByName} 님이 편집 중`}>
+3680-                                <Lock className="w-3.5 h-3.5 text-brand-error" />
+3681-                              </div>
+3682-                            )}
+3683-                            {isEditing && (
+3684:                              <input 
+3685-                                type="text"
+3686-                                defaultValue={req.id}
+3687-                                autoFocus
+3688-                                onBlur={(e) => {
+3689-                                  updateRequirementField(req.id, 'id', e.target.value.trim() || req.id);
+--
+3848-                                            className="w-3.5 h-3.5 shrink-0 inline-flex items-center justify-center rounded border border-brand-outline-variant transition-colors"
+3849-                                          >
+3850-                                            {isAssigned && <Check className="w-2.5 h-2.5 text-brand-on-surface" strokeWidth={4} />}
+3851-                                          </div>
+3852-                                          {/* Hidden real checkbox for accessibility / label linking */}
+3853:                                          <input 
+3854-                                            type="checkbox"
+3855-                                            className="hidden"
+3856-                                            checked={isAssigned}
+3857-                                            onChange={(e) => {
+3858-                                              if (e.target.checked) {
+--
+3885-                            style={cellStyle}
+3886-                            onClick={() => setActiveCellEditor({ rowId: req.id, field: 'dueDate' })}
+3887-                            className={`px-2 py-1 border-r border-brand-outline-variant text-[13px] text-brand-on-surface-variant hover:bg-brand-surface-high/10 cursor-pointer align-top relative ${shadowClass}`}
+3888-                          >
+3889-                            {isEditing && (
+3890:                              <input 
+3891-                                type="date"
+3892-                                defaultValue={req.dueDate}
+3893-                                autoFocus
+3894-                                onPaste={(e) => handleGridPaste(e, req.id, col.id)}
+3895-                                onBlur={(e) => {
+--
+4147-                              style={cellStyle}
+4148-                              onClick={() => setActiveCellEditor({ rowId: req.id, field: col.id })}
+4149-                              className={`px-2 py-1 border-r border-brand-outline-variant cursor-text hover:bg-brand-surface-high/20 transition-colors align-top relative ${shadowClass}`}
+4150-                            >
+4151-                              {isEditing && (
+4152:                                <input 
+4153-                                  type="text"
+4154-                                  defaultValue={cellVal}
+4155-                                  autoFocus
+4156-                                  onBlur={(e) => {
+4157-                                    updateRequirementField(req.id, col.id, e.target.value);
+--
+4297-                                          <div 
+4298-                                            className="w-3.5 h-3.5 shrink-0 inline-flex items-center justify-center rounded border border-brand-outline-variant transition-colors"
+4299-                                          >
+4300-                                            {isAssigned && <Check className="w-2.5 h-2.5 text-brand-on-surface" strokeWidth={4} />}
+4301-                                          </div>
+4302:                                          <input 
+4303-                                            type="checkbox"
+4304-                                            className="hidden"
+4305-                                            checked={isAssigned}
+4306-                                            onChange={(e) => {
+4307-                                              if (e.target.checked) {
+--
+4355-                              style={cellStyle}
+4356-                              onClick={() => setActiveCellEditor({ rowId: req.id, field: col.id })}
+4357-                              className={`px-2 py-1 border-r border-brand-outline-variant text-[13px] text-brand-on-surface-variant hover:bg-brand-surface-high/10 cursor-pointer align-top relative ${shadowClass}`}
+4358-                            >
+4359-                              {isEditing && (
+4360:                                <input 
+4361-                                  type="date"
+4362-                                  defaultValue={cellVal}
+4363-                                  autoFocus
+4364-                                  onPaste={(e) => handleGridPaste(e, req.id, col.id)}
+4365-                                  onBlur={(e) => {

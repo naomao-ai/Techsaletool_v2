@@ -1,0 +1,17 @@
+data
+data/
+locks
+locks/
+changelogs
+changelogs/
+EXPORT
+dist
+node_modules
+*.tmp
+**/*.tmp
+*.bak
+**/*.bak
+*.lock
+**/*.lock
+*.jsonl
+**/*.jsonl
