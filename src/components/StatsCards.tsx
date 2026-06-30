@@ -26,32 +26,30 @@ interface StatsCardsProps {
 
 function StatsCardsComponent({ requirements, columns, openComingSoonModal, onDashboardFilter, configs, onConfigsChange }: StatsCardsProps) {
   // Load saved card configs from localStorage
+  const defaultCards: CardItem[] = [
+    { id: 'card_assignees', config: 'assignees', columns: 4 },
+    { id: 'card_status', config: 'status' },
+    { id: 'card_compliance', config: 'compliance' },
+    { id: 'card_design_impact', config: 'design_impact' },
+  ];
+
   const [cards, setCards] = useState<CardItem[]>(() => {
-    if (configs) return configs;
-    try {
-      const saved = localStorage.getItem('dashboard_card_configs');
-      if (saved) return JSON.parse(saved);
-    } catch {}
-    return [
-      { id: 'card_total', config: 'total' },
-      { id: 'card_progress', config: 'progress' },
-      { id: 'card_assignees', config: 'assignees' },
-      { id: 'card_high_risk', config: 'high_risk' },
-    ];
+    if (configs && configs.length > 0) return configs;
+    return defaultCards;
   });
 
   // Sync from props if they change externally
   useEffect(() => {
-    if (configs) setCards(configs);
+    if (configs && configs.length > 0) {
+      setCards(configs);
+    }
   }, [configs]);
 
-  const updateCards = (updater: React.SetStateAction<CardItem[]>) => {
+  const updateCards = (updater: React.SetStateAction<CardItem[]>, skipGlobalSync = false) => {
     setCards(prev => {
       const next = typeof updater === 'function' ? updater(prev) : updater;
-      if (onConfigsChange) {
+      if (onConfigsChange && !skipGlobalSync) {
         onConfigsChange(next);
-      } else {
-        localStorage.setItem('dashboard_card_configs', JSON.stringify(next));
       }
       return next;
     });
@@ -622,9 +620,12 @@ function StatsCardsComponent({ requirements, columns, openComingSoonModal, onDas
               onDrop={(e) => handleDrop(e, card.id)}
               onContextMenu={(e) => handleContextMenu(e, card.id)}
               onMouseUp={(e) => {
-                // Check if card size changed from resizing
+                // Check if card size changed significantly from resizing
                 const el = e.currentTarget as HTMLDivElement;
-                if (card.width !== el.offsetWidth || card.height !== el.offsetHeight) {
+                const currentW = card.width || 320;
+                const currentH = card.height || el.offsetHeight;
+                
+                if (Math.abs(currentW - el.offsetWidth) > 2 || Math.abs(currentH - el.offsetHeight) > 2) {
                   updateCards(prev => prev.map(c => 
                     c.id === card.id 
                       ? { ...c, width: el.offsetWidth, height: el.offsetHeight } 

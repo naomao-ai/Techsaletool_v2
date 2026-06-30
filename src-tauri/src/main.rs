@@ -153,7 +153,10 @@ async fn acquire_item_lock(project_path: String, item_id: String, user_id: Strin
         if let Ok(content) = fs::read_to_string(&lock_file) {
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
                 let acquired_at = json["acquiredAt"].as_u64().unwrap_or(0);
-                let ttl = json["ttlSeconds"].as_u64().unwrap_or(600);
+                let mut ttl = json["ttlSeconds"].as_u64().unwrap_or(600);
+                if ttl > 15 {
+                    ttl = 15; // Cap legacy long locks
+                }
                 if now < acquired_at + ttl {
                     if json["userId"].as_str().unwrap_or("") != user_id {
                         return Err(format!("Locked by {}", json["userName"].as_str().unwrap_or("another user")));
@@ -167,7 +170,7 @@ async fn acquire_item_lock(project_path: String, item_id: String, user_id: Strin
         "userId": user_id,
         "userName": user_name,
         "acquiredAt": now,
-        "ttlSeconds": 600
+        "ttlSeconds": 15
     });
     
     fs::write(&lock_file, lock_data.to_string()).map_err(|e| e.to_string())?;
@@ -214,7 +217,10 @@ async fn get_active_locks(project_path: String) -> Result<serde_json::Value, Str
                         if let Ok(content) = fs::read_to_string(&file_path) {
                             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
                                 let acquired_at = json["acquiredAt"].as_u64().unwrap_or(0);
-                                let ttl = json["ttlSeconds"].as_u64().unwrap_or(600);
+                                let mut ttl = json["ttlSeconds"].as_u64().unwrap_or(600);
+                                if ttl > 15 {
+                                    ttl = 15; // Cap legacy long locks
+                                }
                                 if now >= acquired_at + ttl {
                                     let _ = fs::remove_file(&file_path);
                                 } else {
@@ -292,7 +298,7 @@ async fn save_binary_file(path: String, contents: Vec<u8>) -> Result<(), String>
 
 #[tauri::command]
 async fn get_server_config(app_handle: tauri::AppHandle) -> Result<serde_json::Value, String> {
-    let exe_path = match app_handle.path().executable_dir() {
+    let exe_path = match app_handle.path().app_data_dir() {
         Ok(dir) => dir,
         Err(_) => std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
     };
@@ -314,7 +320,7 @@ async fn get_server_config(app_handle: tauri::AppHandle) -> Result<serde_json::V
 
 #[tauri::command]
 async fn update_server_config(app_handle: tauri::AppHandle, active_path: String) -> Result<(), String> {
-    let exe_path = match app_handle.path().executable_dir() {
+    let exe_path = match app_handle.path().app_data_dir() {
         Ok(dir) => dir,
         Err(_) => std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
     };
@@ -336,7 +342,7 @@ async fn update_server_config(app_handle: tauri::AppHandle, active_path: String)
 
 #[tauri::command]
 async fn admin_setup_server_environment(app_handle: tauri::AppHandle, project_name: String) -> Result<serde_json::Value, String> {
-    let exe_path = match app_handle.path().executable_dir() {
+    let exe_path = match app_handle.path().app_data_dir() {
         Ok(dir) => dir,
         Err(_) => std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
     };
@@ -502,6 +508,29 @@ fn exit_app() {
     std::process::exit(0);
 }
 
+#[tauri::command]
+async fn copy_file_native(source: String, dest: String) -> Result<(), String> {
+    std::fs::copy(&source, &dest).map_err(|e| format!("Failed to copy file: {}", e))?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn check_file_exists_native(path: String) -> Result<bool, String> {
+    Ok(std::path::Path::new(&path).exists())
+}
+
+#[tauri::command]
+async fn get_file_modified_time_native(path: String) -> Result<u64, String> {
+    if let Ok(meta) = fs::metadata(&path) {
+        if let Ok(modified) = meta.modified() {
+            if let Ok(duration) = modified.duration_since(UNIX_EPOCH) {
+                return Ok(duration.as_millis() as u64);
+            }
+        }
+    }
+    Err("Failed to get modified time".to_string())
+}
+
 fn main() {
     std::panic::set_hook(Box::new(|panic_info| {
         let mut file = std::fs::OpenOptions::new()
@@ -544,7 +573,10 @@ fn main() {
             admin_setup_server_environment,
             convert_to_unc_path,
             open_path_native,
-            exit_app
+            exit_app,
+            copy_file_native,
+            check_file_exists_native,
+            get_file_modified_time_native
         ])
         .run(tauri::generate_context!())
         .expect("앱 실행 중 오류");

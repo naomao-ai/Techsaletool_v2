@@ -104,18 +104,25 @@ export default function CEDashboard({
     }
   }, [contextMenu, reasonPopup, headerMenu]);
 
+  const [tempColWidths, setTempColWidths] = useState<Record<string, number>>({});
+
   useEffect(() => {
     if (resizingCol) {
+      let finalWidth = resizingCol.startWidth;
       const handleMouseMove = (e: MouseEvent) => {
         const diff = e.clientX - resizingCol.startX;
-        const newWidth = Math.max(50, resizingCol.startWidth + diff);
+        finalWidth = Math.max(50, resizingCol.startWidth + diff);
+        setTempColWidths({ [resizingCol.id]: finalWidth });
+      };
+      const handleMouseUp = () => {
         const panelConfig = configs[resizingCol.panelIndex] || {};
-        const newWidths = { ...(panelConfig.colWidths || {}), [resizingCol.id]: newWidth };
+        const newWidths = { ...(panelConfig.colWidths || {}), [resizingCol.id]: finalWidth };
         if (onConfigChange) {
            onConfigChange(resizingCol.panelIndex, { ...configs[resizingCol.panelIndex], colWidths: newWidths });
         }
+        setResizingCol(null);
+        setTempColWidths({});
       };
-      const handleMouseUp = () => setResizingCol(null);
       window.addEventListener('mousemove', handleMouseMove);
       window.addEventListener('mouseup', handleMouseUp);
       return () => {
@@ -123,7 +130,7 @@ export default function CEDashboard({
         window.removeEventListener('mouseup', handleMouseUp);
       };
     }
-  }, [resizingCol, mainConfig.colWidths, configs, onConfigChange]);
+  }, [resizingCol, configs, onConfigChange]);
 
   const exchangeRates = useMemo(() => {
     const saved = localStorage.getItem("app_exchange_rates");
