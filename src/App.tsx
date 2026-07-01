@@ -610,11 +610,33 @@ export default function App() {
         setShowConflictModal(true);
       } else {
         // Auto merged!
+        const normalizedTheirDataStr = JSON.stringify({
+          tabDataMap: theirData.tabDataMap,
+          tabs: theirData.tabs,
+          assigneesPool: theirData.assigneesPool,
+          appName: theirData.appName || statesRef.current.appName,
+          boardItems: theirData.boardItems || statesRef.current.boardItems || [],
+        });
+
+        const normalizedMergedPayloadStr = JSON.stringify({
+          tabDataMap: mergedPayload.tabDataMap,
+          tabs: mergedPayload.tabs,
+          assigneesPool: mergedPayload.assigneesPool,
+          appName: mergedPayload.appName || statesRef.current.appName,
+          boardItems: mergedPayload.boardItems || statesRef.current.boardItems || [],
+        });
+
         if (mergedPayload.tabs) setTabs(mergedPayload.tabs);
         if (mergedPayload.tabDataMap) setTabDataMap(mergedPayload.tabDataMap);
-        setAssigneesPool(mergedPayload.assigneesPool);
+        if (mergedPayload.assigneesPool) setAssigneesPool(mergedPayload.assigneesPool);
 
-        const payloadStr = JSON.stringify(mergedPayload);
+        if (normalizedMergedPayloadStr === normalizedTheirDataStr) {
+          lastSaveRef.current = response.lastModified;
+          lastSavedPayload.current = normalizedTheirDataStr;
+          return;
+        }
+
+        const payloadStr = normalizedMergedPayloadStr;
 
         // Immediately save the resolved data to lock in the merge
         try {

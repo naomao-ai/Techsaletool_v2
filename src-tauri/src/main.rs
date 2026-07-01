@@ -70,13 +70,35 @@ async fn save_data(path: String, data: String, expected_version: u64, state: Sta
     let tmp_path = format!("{}.tmp", &path);
     let bak_path = format!("{}.bak", &path);
     
-    fs::write(&tmp_path, &data).map_err(|e| format!("Failed to write tmp: {}", e))?;
-    
-    if Path::new(&path).exists() {
-        fs::copy(&path, &bak_path).map_err(|e| format!("Failed to create backup: {}", e))?;
+    // Retry write
+    let mut retries = 3;
+    while retries > 0 {
+        if fs::write(&tmp_path, &data).is_ok() {
+            break;
+        }
+        retries -= 1;
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    if retries == 0 {
+        return Err("Failed to write tmp file after retries".to_string());
     }
     
-    fs::rename(&tmp_path, &path).map_err(|e| format!("Failed to rename tmp to original: {}", e))?;
+    if Path::new(&path).exists() {
+        let _ = fs::copy(&path, &bak_path); // Ignore backup failure
+    }
+    
+    // Retry rename
+    retries = 5;
+    while retries > 0 {
+        if fs::rename(&tmp_path, &path).is_ok() {
+            break;
+        }
+        retries -= 1;
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    if retries == 0 {
+        return Err("Failed to rename tmp to original after retries".to_string());
+    }
     
     let new_meta = fs::metadata(&path).unwrap();
     let new_modified = new_meta.modified().unwrap().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
