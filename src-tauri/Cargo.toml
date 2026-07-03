@@ -7,13 +7,19 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+# 동시성/저장 코어를 테스트 가능하게 노출하는 라이브러리 타깃.
+# main.rs(바이너리)와 분리되어 `cargo test --lib` 시 Tauri generate_context 없이 컴파일된다.
+[lib]
+name = "business_requirements_lib"
+path = "src/lib.rs"
+
 [build-dependencies]
-tauri-build = { version = "2.0.0", features = [] }
+tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2.0.0", features = [] }
-tauri-plugin-fs = "2.0.0"
-tauri-plugin-dialog = "2.0.0"
+tauri = { version = "2", features = [] }
+tauri-plugin-fs = "2"
+tauri-plugin-dialog = "2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 notify = "6.1.1"

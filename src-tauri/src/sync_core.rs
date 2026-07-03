@@ -1,0 +1,638 @@
+//! 동시성/저장 코어 로직 (Tauri 비의존).
+//!
+//! main.rs의 `#[tauri::command]` 함수들(`read_data`, `save_data`, `acquire_item_lock`,
+//! `get_active_locks`, `release_item_lock`)이 위임하는 실제 구현.
+//! 커맨드는 이 함수를 호출하고, 동시성 테스트는 이 순수 함수를 직접 스레드로
+//! 호출해 경쟁 조건을 재현한다.
+//!
+//! ── 결함 #3·#4 수정 (2026-07-03) ──────────────────────────────────────
+//! 기존에는 파일 mtime을 "버전"으로 사용하고 500ms 오차를 허용했는데(§4 근본원인 1),
+//! 이 창 안에서 동시 저장하면 lost update가 발생했다(결함#3). 또한 아이템 락은
+//! `save_data` 경로가 전혀 참조하지 않아 락 보유 중에도 덮어쓰기가 가능했다(결함#4).
+//!
+//! 수정: payload 루트에 단조 증가 `_rev` 필드를 두고, `save_data`가 저장 직전
+//! "현재 파일을 다시 읽어 `_rev` 비교(compare-and-swap)"하도록 바꿨다. mtime·클럭에
+//! 전혀 의존하지 않으므로 SMB/네트워크 지연·클럭 스큐에도 견고하다. 또한 read→비교→write
+//! 임계구역을 프로세스 간에도 유효한 파일 잠금(`{path}.critical.lock`, O_EXCL 생성)으로
+//! 감싸 진짜 상호배제를 확보했다(결함#3의 근본원인 ②). 마지막으로 저장 대상 payload와
+//! 직전 파일 내용을 비교해 변경된 요구항목 id를 뽑아, 그 id에 대한 활성 아이템 락이
+//! 타 사용자 소유면 저장 자체를 거부(`ITEM_LOCKED:<id>`)하도록 해 락과 저장 경로를
+//! 실제로 연동했다(결함#4).
+//!
+//! 하위호환: `_rev` 필드가 없는 기존 파일은 `_rev=0`으로 간주한다(마이그레이션 불필요).
+
+use std::collections::HashMap;
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, UNIX_EPOCH};
+
+/// 아이템 락 TTL (초). 원본 main.rs와 동일(15초로 캡).
+pub const LOCK_TTL_SECONDS: u64 = 15;
+/// 임계구역 락(critical section) 최대 대기 시간.
+const CRITICAL_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+/// 임계구역 락 파일이 이 시간 이상 방치되면(보유 프로세스 비정상 종료로 간주) 강제 회수.
+const CRITICAL_LOCK_STALE_AFTER: Duration = Duration::from_secs(5);
+
+// ══════════════════════════════════════════════════════════════════════
+//  임계구역 락 — 프로세스 간 상호배제 (결함#3 근본원인 ② 해결)
+// ══════════════════════════════════════════════════════════════════════
+
+/// `{data_path}.critical.lock`을 O_EXCL(`create_new`)로 생성해 임계구역을 보호하는
+/// RAII 가드. 드롭 시 자동으로 락 파일을 제거한다. 보유 프로세스가 비정상 종료해
+/// 락 파일이 고아로 남으면, TTL(5초) 경과 후 다음 획득 시도자가 강제로 회수한다.
+struct CriticalSection {
+    lock_path: PathBuf,
+}
+
+impl CriticalSection {
+    fn acquire(data_path: &str) -> Result<Self, String> {
+        let lock_path = PathBuf::from(format!("{}.critical.lock", data_path));
+        let deadline = Instant::now() + CRITICAL_LOCK_TIMEOUT;
+
+        loop {
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&lock_path)
+            {
+                Ok(mut f) => {
+                    let _ = f.write_all(std::process::id().to_string().as_bytes());
+                    return Ok(CriticalSection { lock_path });
+                }
+                Err(_) => {
+                    // 스테일 락 회수: 보유 프로세스가 죽어 정리되지 못한 경우
+                    if let Ok(meta) = fs::metadata(&lock_path) {
+                        if let Ok(modified) = meta.modified() {
+                            if modified.elapsed().unwrap_or_default() > CRITICAL_LOCK_STALE_AFTER {
+                                let _ = fs::remove_file(&lock_path);
+                                continue;
+                            }
+                        }
+                    }
+                    if Instant::now() >= deadline {
+                        return Err("LOCK_TIMEOUT".to_string());
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        }
+    }
+}
+
+impl Drop for CriticalSection {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.lock_path);
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+//  읽기/쓰기 헬퍼
+// ══════════════════════════════════════════════════════════════════════
+
+/// 파일의 현재 값과 `_rev`(없으면 0)를 읽는다. 파일이 없거나 파싱 실패 시 (`{}`, 0).
+fn read_current(path: &str) -> (serde_json::Value, u64) {
+    match fs::read_to_string(path) {
+        Ok(content) => match serde_json::from_str::<serde_json::Value>(&content) {
+            Ok(v) => {
+                let rev = v.get("_rev").and_then(|r| r.as_u64()).unwrap_or(0);
+                (v, rev)
+            }
+            Err(_) => (serde_json::json!({}), 0),
+        },
+        Err(_) => (serde_json::json!({}), 0),
+    }
+}
+
+/// `read_data` 커맨드의 코어. `.bak` 자동 복구 포함(원본 main.rs 동작 유지) + `_rev` 반환.
+pub fn read_data_inner(path: &str) -> Result<(serde_json::Value, u64), String> {
+    let content = fs::read_to_string(path);
+
+    let json_val = match content {
+        Ok(c) => match serde_json::from_str::<serde_json::Value>(&c) {
+            Ok(j) => j,
+            Err(_) => recover_from_backup(path)?,
+        },
+        Err(_) => recover_from_backup(path)?,
+    };
+
+    let rev = json_val.get("_rev").and_then(|r| r.as_u64()).unwrap_or(0);
+    Ok((json_val, rev))
+}
+
+fn recover_from_backup(path: &str) -> Result<serde_json::Value, String> {
+    let bak_path = format!("{}.bak", path);
+    if Path::new(&bak_path).exists() {
+        let bak_content = fs::read_to_string(&bak_path).map_err(|e| e.to_string())?;
+        let bak_json: serde_json::Value =
+            serde_json::from_str(&bak_content).map_err(|e| e.to_string())?;
+        fs::write(path, &bak_content).unwrap_or(());
+        Ok(bak_json)
+    } else {
+        Err("Failed to parse JSON and no backup available".to_string())
+    }
+}
+
+/// tmp 기록 + 백업 + rename의 원자적 쓰기(원본 main.rs와 동일한 재시도 정책).
+fn atomic_write(path: &str, data: &str) -> Result<(), String> {
+    let tmp_path = format!("{}.tmp", path);
+    let bak_path = format!("{}.bak", path);
+
+    let mut retries = 3;
+    while retries > 0 {
+        if fs::write(&tmp_path, data).is_ok() {
+            break;
+        }
+        retries -= 1;
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    if retries == 0 {
+        return Err("Failed to write tmp file after retries".to_string());
+    }
+
+    if Path::new(path).exists() {
+        let _ = fs::copy(path, &bak_path);
+    }
+
+    retries = 5;
+    while retries > 0 {
+        if fs::rename(&tmp_path, path).is_ok() {
+            break;
+        }
+        retries -= 1;
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    if retries == 0 {
+        return Err("Failed to rename tmp to original after retries".to_string());
+    }
+
+    Ok(())
+}
+
+// ══════════════════════════════════════════════════════════════════════
+//  아이템 락 ↔ 저장 경로 연동 (결함#4 해결)
+// ══════════════════════════════════════════════════════════════════════
+
+/// payload의 `tabDataMap.*.requirements[]`에서 `id -> 정규화된 내용 문자열` 맵 추출.
+fn extract_requirement_map(value: &serde_json::Value) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    if let Some(tab_data_map) = value.get("tabDataMap").and_then(|v| v.as_object()) {
+        for tab_data in tab_data_map.values() {
+            if let Some(reqs) = tab_data.get("requirements").and_then(|v| v.as_array()) {
+                for req in reqs {
+                    if let Some(id) = req.get("id").and_then(|v| v.as_str()) {
+                        map.insert(id.to_string(), req.to_string());
+                    }
+                }
+            }
+        }
+    }
+    map
+}
+
+/// 직전 파일 내용(old)과 저장하려는 내용(new)을 비교해 변경/삭제된 요구항목 id 중,
+/// 활성 아이템 락이 **타 사용자** 소유인 것이 있으면 그 id를 반환(=저장 거부 사유).
+fn find_locked_conflict(
+    locks_dir: &Path,
+    old: &serde_json::Value,
+    new: &serde_json::Value,
+    user_id: &str,
+) -> Option<String> {
+    let old_map = extract_requirement_map(old);
+    let new_map = extract_requirement_map(new);
+
+    let mut touched: Vec<String> = Vec::new();
+    for (id, new_content) in &new_map {
+        match old_map.get(id) {
+            Some(old_content) if old_content == new_content => {}
+            _ => touched.push(id.clone()),
+        }
+    }
+    for id in old_map.keys() {
+        if !new_map.contains_key(id) {
+            touched.push(id.clone()); // 삭제도 충돌 대상
+        }
+    }
+    if touched.is_empty() {
+        return None;
+    }
+
+    let active_locks = get_active_locks_from_dir(locks_dir);
+    for id in &touched {
+        if let Some(lock) = active_locks.get(id) {
+            let owner = lock.get("userId").and_then(|v| v.as_str()).unwrap_or("");
+            if !owner.is_empty() && owner != user_id {
+                return Some(id.clone());
+            }
+        }
+    }
+    None
+}
+
+fn get_active_locks_from_dir(locks_dir: &Path) -> serde_json::Map<String, serde_json::Value> {
+    let mut active_locks = serde_json::Map::new();
+    let now = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    if locks_dir.exists() {
+        if let Ok(entries) = fs::read_dir(locks_dir) {
+            for entry in entries.flatten() {
+                let file_path = entry.path();
+                if let Some(name) = file_path.file_name().and_then(|n| n.to_str()) {
+                    if name.starts_with("item_") && name.ends_with(".lock") {
+                        if let Ok(content) = fs::read_to_string(&file_path) {
+                            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+                                let acquired_at = json["acquiredAt"].as_u64().unwrap_or(0);
+                                let mut ttl = json["ttlSeconds"].as_u64().unwrap_or(600);
+                                if ttl > LOCK_TTL_SECONDS {
+                                    ttl = LOCK_TTL_SECONDS;
+                                }
+                                if now < acquired_at + ttl {
+                                    if let Some(id) = name
+                                        .strip_prefix("item_")
+                                        .and_then(|s| s.strip_suffix(".lock"))
+                                    {
+                                        active_locks.insert(id.to_string(), json);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    active_locks
+}
+
+// ══════════════════════════════════════════════════════════════════════
+//  save_data — _rev 기반 CAS + 임계구역 락 + 아이템 락 검증
+// ══════════════════════════════════════════════════════════════════════
+
+/// `save_data` 커맨드의 코어.
+/// - `expected_rev`가 파일의 현재 `_rev`와 다르면 `VERSION_CONFLICT`.
+/// - 저장하려는 변경분 중 타 사용자가 보유한 활성 아이템 락과 겹치면 `ITEM_LOCKED:<id>`.
+/// - 성공 시 파일에 `_rev = expected_rev + 1`을 기록하고 새 rev를 반환.
+/// - 전체 과정(읽기→비교→쓰기)은 프로세스 간에도 유효한 임계구역 락으로 보호된다.
+pub fn save_data_inner(
+    path: &str,
+    data: &str,
+    expected_rev: u64,
+    user_id: &str,
+) -> Result<u64, String> {
+    let _guard = CriticalSection::acquire(path)?;
+
+    let (current_value, current_rev) = read_current(path);
+    if current_rev != expected_rev {
+        return Err("VERSION_CONFLICT".to_string());
+    }
+
+    let mut new_value: serde_json::Value =
+        serde_json::from_str(data).map_err(|e| format!("Invalid JSON payload: {}", e))?;
+
+    if let Some(parent) = Path::new(path).parent() {
+        let locks_dir = parent.join("locks");
+        if let Some(conflict_id) =
+            find_locked_conflict(&locks_dir, &current_value, &new_value, user_id)
+        {
+            return Err(format!("ITEM_LOCKED:{}", conflict_id));
+        }
+    }
+
+    let new_rev = expected_rev + 1;
+    if let Some(obj) = new_value.as_object_mut() {
+        obj.insert("_rev".to_string(), serde_json::json!(new_rev));
+    }
+    let new_data_str = serde_json::to_string(&new_value).map_err(|e| e.to_string())?;
+
+    atomic_write(path, &new_data_str)?;
+
+    Ok(new_rev)
+}
+
+/// `acquire_item_lock` 커맨드의 코어. 파일 기반 낙관적 락.
+pub fn acquire_item_lock_inner(
+    project_path: &str,
+    item_id: &str,
+    user_id: &str,
+    user_name: &str,
+) -> Result<bool, String> {
+    let path = Path::new(project_path);
+    let parent = path.parent().ok_or("Invalid path")?;
+    let locks_dir = parent.join("locks");
+
+    if !locks_dir.exists() {
+        fs::create_dir_all(&locks_dir).map_err(|e| e.to_string())?;
+    }
+
+    let lock_file = locks_dir.join(format!("item_{}.lock", item_id));
+    let now = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    if lock_file.exists() {
+        if let Ok(content) = fs::read_to_string(&lock_file) {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+                let acquired_at = json["acquiredAt"].as_u64().unwrap_or(0);
+                let mut ttl = json["ttlSeconds"].as_u64().unwrap_or(600);
+                if ttl > 15 {
+                    ttl = 15;
+                }
+                if now < acquired_at + ttl {
+                    if json["userId"].as_str().unwrap_or("") != user_id {
+                        return Err(format!(
+                            "Locked by {}",
+                            json["userName"].as_str().unwrap_or("another user")
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    let lock_data = serde_json::json!({
+        "userId": user_id,
+        "userName": user_name,
+        "acquiredAt": now,
+        "ttlSeconds": LOCK_TTL_SECONDS
+    });
+
+    fs::write(&lock_file, lock_data.to_string()).map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+/// `release_item_lock` 커맨드의 코어.
+pub fn release_item_lock_inner(
+    project_path: &str,
+    item_id: &str,
+    user_id: &str,
+    force: Option<bool>,
+) -> Result<bool, String> {
+    let path = Path::new(project_path);
+    let parent = path.parent().ok_or("Invalid path")?;
+    let lock_file = parent.join("locks").join(format!("item_{}.lock", item_id));
+
+    if lock_file.exists() {
+        if force.unwrap_or(false) {
+            fs::remove_file(&lock_file).map_err(|e| e.to_string())?;
+            return Ok(true);
+        }
+        if let Ok(content) = fs::read_to_string(&lock_file) {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+                if json["userId"].as_str().unwrap_or("") == user_id {
+                    fs::remove_file(&lock_file).map_err(|e| e.to_string())?;
+                }
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// `get_active_locks` 커맨드의 코어.
+pub fn get_active_locks_inner(project_path: &str) -> Result<serde_json::Value, String> {
+    let path = Path::new(project_path);
+    let parent = path.parent().ok_or("Invalid path")?;
+    let locks_dir = parent.join("locks");
+
+    let mut active_locks = serde_json::Map::new();
+    let now = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    if locks_dir.exists() {
+        if let Ok(entries) = fs::read_dir(&locks_dir) {
+            for entry in entries.flatten() {
+                let file_path = entry.path();
+                if let Some(name) = file_path.file_name().and_then(|n| n.to_str()) {
+                    if name.starts_with("item_") && name.ends_with(".lock") {
+                        if let Ok(content) = fs::read_to_string(&file_path) {
+                            if let Ok(json) =
+                                serde_json::from_str::<serde_json::Value>(&content)
+                            {
+                                let acquired_at = json["acquiredAt"].as_u64().unwrap_or(0);
+                                let mut ttl = json["ttlSeconds"].as_u64().unwrap_or(600);
+                                if ttl > 15 {
+                                    ttl = 15;
+                                }
+                                if now >= acquired_at + ttl {
+                                    let _ = fs::remove_file(&file_path);
+                                } else if let Some(id) = name
+                                    .strip_prefix("item_")
+                                    .and_then(|s| s.strip_suffix(".lock"))
+                                {
+                                    active_locks.insert(id.to_string(), json);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(serde_json::Value::Object(active_locks))
+}
+
+// ══════════════════════════════════════════════════════════════════════
+//  L2 동시성 테스트 — 결함#3(버전 경합)·#4(락이 저장을 못막음)가
+//  이제 "안전하게 방지됨"을 단언한다(수정 전에는 "결함 존재"를 단언했음).
+// ══════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+    use std::thread;
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn unique_dir(tag: &str) -> std::path::PathBuf {
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let mut p = std::env::temp_dir();
+        p.push(format!("techsale_l2_{}_{}_{}_{}", tag, std::process::id(), n, nanos));
+        fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn rev_of(path: &Path) -> u64 {
+        read_current(path.to_str().unwrap()).1
+    }
+
+    // ── 대조군: 정상 순차 저장은 rev가 1씩 증가하며 계속 성공 ──────────
+    #[test]
+    fn control_sequential_saves_increment_rev() {
+        let dir = unique_dir("ctrl_seq");
+        let path = dir.join("data.json");
+        let p = path.to_str().unwrap();
+        fs::write(&path, r#"{"tabDataMap":{}}"#).unwrap();
+        assert_eq!(rev_of(&path), 0, "신규(무 _rev) 파일은 rev=0으로 간주");
+
+        let r1 = save_data_inner(p, r#"{"tabDataMap":{},"author":"A"}"#, 0, "userA");
+        assert_eq!(r1, Ok(1), "첫 저장은 rev=1을 반환해야 함");
+        assert_eq!(rev_of(&path), 1);
+
+        let r2 = save_data_inner(p, r#"{"tabDataMap":{},"author":"A2"}"#, 1, "userA");
+        assert_eq!(r2, Ok(2), "정확한 expected_rev로 재저장하면 rev=2");
+    }
+
+    // ── 신규 파일(존재하지 않음)에 대한 첫 저장 ──────────────────────
+    #[test]
+    fn control_first_save_on_nonexistent_file() {
+        let dir = unique_dir("ctrl_new");
+        let path = dir.join("brand_new.json");
+        let p = path.to_str().unwrap();
+        assert!(!path.exists());
+
+        let r = save_data_inner(p, r#"{"tabDataMap":{}}"#, 0, "userA");
+        assert_eq!(r, Ok(1), "존재하지 않는 파일도 expected_rev=0이면 첫 저장 성공");
+    }
+
+    // ── [수정 확인] 결함#3: 동시 저장 시 이제 lost update가 발생하지 않는다 ──
+    // A와 B가 같은 rev(0)를 읽고 순차 저장 시도 → A는 성공(rev=1), B는 stale rev(0)라
+    // VERSION_CONFLICT로 안전하게 거부되어야 한다(과거엔 500ms 창 안에서 조용히 통과·유실).
+    #[test]
+    fn risk2_fixed_stale_rev_save_is_rejected_not_lost() {
+        let dir = unique_dir("risk2_fixed");
+        let path = dir.join("data.json");
+        let p = path.to_str().unwrap();
+        fs::write(&path, r#"{"tabDataMap":{}}"#).unwrap();
+        let v0 = rev_of(&path);
+
+        // A와 B 모두 v0(=0)을 읽은 상태에서 저장 시도 (예전엔 500ms 이내라 둘 다 성공했음)
+        let a = save_data_inner(p, r#"{"tabDataMap":{},"author":"A"}"#, v0, "userA");
+        assert_eq!(a, Ok(1), "A 저장 성공(rev 0→1)");
+
+        let b = save_data_inner(p, r#"{"tabDataMap":{},"author":"B"}"#, v0, "userB");
+        assert!(
+            b.is_err() && b.as_ref().unwrap_err() == "VERSION_CONFLICT",
+            "[수정 확인] stale rev로 저장 시도한 B는 VERSION_CONFLICT로 거부되어야 함(더 이상 통과 못함). 실제={:?}",
+            b
+        );
+
+        let final_content = fs::read_to_string(&path).unwrap();
+        assert!(
+            final_content.contains(r#""author":"A""#),
+            "[수정 확인] A의 저장이 더 이상 유실되지 않고 파일에 남아 있어야 함. 최종={final_content}"
+        );
+
+        // B가 최신 rev(1)로 재조회 후 재시도하면 성공(정상적인 재시도 경로)
+        let b_retry = save_data_inner(p, r#"{"tabDataMap":{},"author":"B"}"#, 1, "userB");
+        assert_eq!(b_retry, Ok(2), "최신 rev로 재시도하면 B도 성공해야 함(유실 없이 순차 반영)");
+    }
+
+    // ── [수정 확인] 결함#3(스레드): 동시 저장은 임계구역 락으로 직렬화되고,
+    // 정확히 한쪽만 성공(rev CAS 통과)하며 다른 쪽은 VERSION_CONFLICT로 안전 거부된다.
+    // (예전엔 두 스레드 모두 성공 → 상호배제 부재로 한쪽이 조용히 유실됐음)
+    #[test]
+    fn risk2_fixed_threaded_mutual_exclusion_prevents_lost_update() {
+        let dir = unique_dir("risk2t_fixed");
+        let path = dir.join("data.json");
+        fs::write(&path, r#"{"tabDataMap":{}}"#).unwrap();
+        let v0 = rev_of(&path);
+        let p = Arc::new(path.to_str().unwrap().to_string());
+
+        let mut handles = vec![];
+        for author in ["A", "B"] {
+            let p = Arc::clone(&p);
+            handles.push(thread::spawn(move || {
+                save_data_inner(
+                    &p,
+                    &format!(r#"{{"tabDataMap":{{}},"author":"{author}"}}"#),
+                    v0,
+                    author,
+                )
+            }));
+        }
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        let ok_count = results.iter().filter(|r| r.is_ok()).count();
+        assert_eq!(
+            ok_count, 1,
+            "[수정 확인] 임계구역 락으로 직렬화되어 정확히 한쪽만 성공해야 함(다른 쪽은 CAS 실패, 상호배제 확보). 실제={results:?}"
+        );
+        let conflict_count = results
+            .iter()
+            .filter(|r| r.as_ref().err().map(|e| e == "VERSION_CONFLICT").unwrap_or(false))
+            .count();
+        assert_eq!(conflict_count, 1, "패자는 반드시 VERSION_CONFLICT(안전 거부)여야 함. 실제={results:?}");
+
+        // 유실이 아니라 "거부"이므로 실패한 쪽은 최신 rev로 재시도해 데이터를 보존할 수 있다
+        // (App.tsx의 executeSmartMerge가 이 재시도·병합을 담당).
+    }
+
+    // ── 대조군: 락 획득/충돌 자체는 정상 동작(변경 없음) ────────────
+    #[test]
+    fn control_item_lock_blocks_second_user() {
+        let dir = unique_dir("lockctrl");
+        let path = dir.join("data.json");
+        let p = path.to_str().unwrap();
+        fs::write(&path, "{}").unwrap();
+
+        let a = acquire_item_lock_inner(p, "REQ-001", "userA", "Alice");
+        assert!(a.is_ok(), "A가 락 획득");
+        let b = acquire_item_lock_inner(p, "REQ-001", "userB", "Bob");
+        assert!(
+            b.is_err() && b.as_ref().unwrap_err().contains("Locked by"),
+            "다른 사용자 B의 같은 아이템 락은 거부되어야 함. 실제={:?}",
+            b
+        );
+    }
+
+    // ── [수정 확인] 결함#4: 아이템 락 보유 중에는 그 아이템을 건드리는 저장이 거부된다 ──
+    // A가 REQ-001을 편집(락 보유) 중, B가 전체 파일 저장을 시도하면서 REQ-001 내용을
+    // 바꾸려 하면 ITEM_LOCKED로 거부되어야 한다(예전엔 save_data가 락을 전혀 참조 안 해 통과).
+    #[test]
+    fn risk3_fixed_item_lock_blocks_conflicting_save() {
+        let dir = unique_dir("risk3_fixed");
+        let path = dir.join("data.json");
+        let p = path.to_str().unwrap();
+        let base = r#"{"tabDataMap":{"t1":{"requirements":[{"id":"REQ-001","editing_by":"A"}]}}}"#;
+        fs::write(&path, base).unwrap();
+        let v0 = rev_of(&path);
+
+        // A가 REQ-001 편집 락 획득
+        let lock = acquire_item_lock_inner(p, "REQ-001", "userA", "Alice");
+        assert!(lock.is_ok(), "A가 REQ-001 락 획득");
+        let active = get_active_locks_inner(p).unwrap();
+        assert!(active.get("REQ-001").is_some(), "REQ-001 락이 활성 상태여야 함");
+
+        // B가 락을 무시하고 REQ-001을 변경하는 전체 파일 저장 시도
+        let changed = r#"{"tabDataMap":{"t1":{"requirements":[{"id":"REQ-001","overwritten_by":"B"}]}}}"#;
+        let b = save_data_inner(p, changed, v0, "userB");
+        assert!(
+            b.is_err() && b.as_ref().unwrap_err().starts_with("ITEM_LOCKED:REQ-001"),
+            "[수정 확인] 락 보유 중인 REQ-001을 건드리는 저장은 ITEM_LOCKED로 거부되어야 함. 실제={:?}",
+            b
+        );
+
+        let final_content = fs::read_to_string(&path).unwrap();
+        assert!(
+            final_content.contains("editing_by") && !final_content.contains("overwritten_by"),
+            "[수정 확인] A가 편집 중이던 REQ-001 데이터가 보존되어야 함. 최종={final_content}"
+        );
+
+        // 락 소유자 본인(A)이 REQ-001을 수정해 저장하는 것은 허용되어야 함
+        let by_owner = r#"{"tabDataMap":{"t1":{"requirements":[{"id":"REQ-001","editing_by":"A_updated"}]}}}"#;
+        let a_save = save_data_inner(p, by_owner, v0, "userA");
+        assert!(a_save.is_ok(), "락 소유자 본인의 저장은 허용되어야 함. 실제={:?}", a_save);
+
+        // 락과 무관한 다른 요구항목 저장은 영향받지 않음
+        let dir2 = unique_dir("risk3_fixed_unrelated");
+        let path2 = dir2.join("data.json");
+        let p2 = path2.to_str().unwrap();
+        fs::write(&path2, r#"{"tabDataMap":{"t1":{"requirements":[{"id":"REQ-001","x":1},{"id":"REQ-002","x":1}]}}}"#).unwrap();
+        let v0_2 = rev_of(&path2);
+        acquire_item_lock_inner(p2, "REQ-001", "userA", "Alice").unwrap();
+        let touch_other = r#"{"tabDataMap":{"t1":{"requirements":[{"id":"REQ-001","x":1},{"id":"REQ-002","x":2}]}}}"#;
+        let c = save_data_inner(p2, touch_other, v0_2, "userC");
+        assert!(c.is_ok(), "락과 무관한 REQ-002만 바뀐 저장은 통과해야 함. 실제={:?}", c);
+    }
+}

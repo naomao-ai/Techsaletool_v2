@@ -15,6 +15,9 @@ export default defineConfig(() => {
     build: {
       assetsInlineLimit: 100000000,
     },
+    optimizeDeps: {
+      entries: ['index.html'],
+    },
     server: {
       // HMR is disabled in AI Studio via DISABLE_HMR env var.
       // Do not modifyâfile watching is disabled to prevent flickering during agent edits.

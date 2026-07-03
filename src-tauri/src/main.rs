@@ -11,99 +11,31 @@ use notify::Watcher;
 use std::sync::mpsc;
 use tokio::sync::Mutex;
 use std::io::Write;
+use business_requirements_lib::sync_core;
 
 struct AppState {
     write_lock: Mutex<()>,
 }
 
-// ① 파일 읽기 명령 — 공유 폴더 JSON 로드 및 .bak 자동 복구
+// ① 파일 읽기 명령 — 공유 폴더 JSON 로드 및 .bak 자동 복구 (sync_core에 위임)
+// 결함#3 수정: mtime 대신 payload 루트의 `_rev`(단조 증가 카운터)를 함께 반환한다.
+// `_rev`가 없는 기존 파일은 0으로 간주(하위호환, 마이그레이션 불필요).
 #[tauri::command]
 async fn read_data(path: String) -> Result<serde_json::Value, String> {
-    let content = fs::read_to_string(&path);
-    
-    let json_val = match content {
-        Ok(c) => match serde_json::from_str::<serde_json::Value>(&c) {
-            Ok(j) => j,
-            Err(_) => {
-                let bak_path = format!("{}.bak", path);
-                if Path::new(&bak_path).exists() {
-                    let bak_content = fs::read_to_string(&bak_path).map_err(|e| e.to_string())?;
-                    let bak_json: serde_json::Value = serde_json::from_str(&bak_content).map_err(|e| e.to_string())?;
-                    fs::write(&path, &bak_content).unwrap_or(());
-                    bak_json
-                } else {
-                    return Err("Failed to parse JSON and no backup available".to_string());
-                }
-            }
-        },
-        Err(e) => {
-            let bak_path = format!("{}.bak", path);
-            if Path::new(&bak_path).exists() {
-                let bak_content = fs::read_to_string(&bak_path).map_err(|e| e.to_string())?;
-                let bak_json: serde_json::Value = serde_json::from_str(&bak_content).map_err(|e| e.to_string())?;
-                fs::write(&path, &bak_content).unwrap_or(());
-                bak_json
-            } else {
-                return Err(e.to_string());
-            }
-        }
-    };
-    
-    let meta = fs::metadata(&path).map_err(|e| e.to_string())?;
-    let modified = meta.modified().unwrap().duration_since(UNIX_EPOCH).unwrap().as_millis();
-    
-    Ok(serde_json::json!({ "data": json_val, "lastModified": modified as u64 }))
+    let (json_val, rev) = sync_core::read_data_inner(&path)?;
+    Ok(serde_json::json!({ "data": json_val, "rev": rev }))
 }
 
-// ② 파일 쓰기 명령 — Atomic Write + Write Queue
+// ② 파일 쓰기 명령 — _rev 기반 CAS(compare-and-swap) + 임계구역 락 + 아이템 락 검증 (sync_core에 위임)
+// 결함#3 수정: mtime 500ms 오차창 대신, 저장 직전 파일을 다시 읽어 `_rev`를 정확히 비교한다.
+//   불일치 → VERSION_CONFLICT. 일치 → `_rev+1`로 원자적 기록.
+// 결함#4 수정: 저장하려는 변경분이 타 사용자가 보유한 활성 아이템 락과 겹치면 ITEM_LOCKED로 거부.
+// `state.write_lock`(프로세스 내부)에 더해, sync_core 내부의 임계구역 파일 락이 프로세스 간
+// 상호배제까지 보장한다(결함#3 근본원인 ②).
 #[tauri::command]
-async fn save_data(path: String, data: String, expected_version: u64, state: State<'_, AppState>) -> Result<u64, String> {
-    let _lock = state.write_lock.lock().await; // 직렬 저장 큐
-    
-    if let Ok(meta) = fs::metadata(&path) {
-        let server_ts = meta.modified().unwrap().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
-        if server_ts > expected_version + 500 { // 500ms 오차 허용
-            return Err("VERSION_CONFLICT".to_string());
-        }
-    }
-    
-    let tmp_path = format!("{}.tmp", &path);
-    let bak_path = format!("{}.bak", &path);
-    
-    // Retry write
-    let mut retries = 3;
-    while retries > 0 {
-        if fs::write(&tmp_path, &data).is_ok() {
-            break;
-        }
-        retries -= 1;
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-    if retries == 0 {
-        return Err("Failed to write tmp file after retries".to_string());
-    }
-    
-    if Path::new(&path).exists() {
-        let _ = fs::copy(&path, &bak_path); // Ignore backup failure
-    }
-    
-    // Retry rename
-    retries = 5;
-    while retries > 0 {
-        if fs::rename(&tmp_path, &path).is_ok() {
-            break;
-        }
-        retries -= 1;
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-    if retries == 0 {
-        return Err("Failed to rename tmp to original after retries".to_string());
-    }
-    
-    let new_meta = fs::metadata(&path).unwrap();
-    let new_modified = new_meta.modified().unwrap().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
-    
-    Ok(new_modified)
+async fn save_data(path: String, data: String, expected_rev: u64, user_id: Option<String>, state: State<'_, AppState>) -> Result<u64, String> {
+    let _lock = state.write_lock.lock().await; // 프로세스 내 직렬 저장 큐(임계구역 락과 병행, 방어적 이중화)
+    sync_core::save_data_inner(&path, &data, expected_rev, &user_id.unwrap_or_default())
 }
 
 // ③ File Watcher
@@ -157,108 +89,20 @@ async fn start_file_watcher(path: String, window: tauri::Window) -> Result<(), S
     Ok(())
 }
 
-// ④ 항목 잠금 명령 — Optimistic Lock 획득
+// ④ 항목 잠금 명령 — Optimistic Lock 획득 (sync_core에 위임, 결함#4 수정으로 save_data와 연동됨)
 #[tauri::command]
 async fn acquire_item_lock(project_path: String, item_id: String, user_id: String, user_name: String) -> Result<bool, String> {
-    let path = Path::new(&project_path);
-    let parent = path.parent().ok_or("Invalid path")?;
-    let locks_dir = parent.join("locks");
-    
-    if !locks_dir.exists() {
-        fs::create_dir_all(&locks_dir).map_err(|e| e.to_string())?;
-    }
-    
-    let lock_file = locks_dir.join(format!("item_{}.lock", item_id));
-    let now = std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-    
-    if lock_file.exists() {
-        if let Ok(content) = fs::read_to_string(&lock_file) {
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
-                let acquired_at = json["acquiredAt"].as_u64().unwrap_or(0);
-                let mut ttl = json["ttlSeconds"].as_u64().unwrap_or(600);
-                if ttl > 15 {
-                    ttl = 15; // Cap legacy long locks
-                }
-                if now < acquired_at + ttl {
-                    if json["userId"].as_str().unwrap_or("") != user_id {
-                        return Err(format!("Locked by {}", json["userName"].as_str().unwrap_or("another user")));
-                    }
-                }
-            }
-        }
-    }
-    
-    let lock_data = serde_json::json!({
-        "userId": user_id,
-        "userName": user_name,
-        "acquiredAt": now,
-        "ttlSeconds": 15
-    });
-    
-    fs::write(&lock_file, lock_data.to_string()).map_err(|e| e.to_string())?;
-    Ok(true)
+    sync_core::acquire_item_lock_inner(&project_path, &item_id, &user_id, &user_name)
 }
 
 #[tauri::command]
 async fn release_item_lock(project_path: String, item_id: String, user_id: String, force: Option<bool>) -> Result<bool, String> {
-    let path = Path::new(&project_path);
-    let parent = path.parent().ok_or("Invalid path")?;
-    let lock_file = parent.join("locks").join(format!("item_{}.lock", item_id));
-    
-    if lock_file.exists() {
-        if force.unwrap_or(false) {
-             fs::remove_file(&lock_file).map_err(|e| e.to_string())?;
-             return Ok(true);
-        }
-        if let Ok(content) = fs::read_to_string(&lock_file) {
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
-                if json["userId"].as_str().unwrap_or("") == user_id {
-                    fs::remove_file(&lock_file).map_err(|e| e.to_string())?;
-                }
-            }
-        }
-    }
-    Ok(true)
+    sync_core::release_item_lock_inner(&project_path, &item_id, &user_id, force)
 }
 
 #[tauri::command]
 async fn get_active_locks(project_path: String) -> Result<serde_json::Value, String> {
-    let path = Path::new(&project_path);
-    let parent = path.parent().ok_or("Invalid path")?;
-    let locks_dir = parent.join("locks");
-    
-    let mut active_locks = serde_json::Map::new();
-    let now = std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-    
-    if locks_dir.exists() {
-        if let Ok(entries) = fs::read_dir(&locks_dir) {
-            for entry in entries.flatten() {
-                let file_path = entry.path();
-                if let Some(name) = file_path.file_name().and_then(|n| n.to_str()) {
-                    if name.starts_with("item_") && name.ends_with(".lock") {
-                        if let Ok(content) = fs::read_to_string(&file_path) {
-                            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
-                                let acquired_at = json["acquiredAt"].as_u64().unwrap_or(0);
-                                let mut ttl = json["ttlSeconds"].as_u64().unwrap_or(600);
-                                if ttl > 15 {
-                                    ttl = 15; // Cap legacy long locks
-                                }
-                                if now >= acquired_at + ttl {
-                                    let _ = fs::remove_file(&file_path);
-                                } else {
-                                    if let Some(id) = name.strip_prefix("item_").and_then(|s| s.strip_suffix(".lock")) {
-                                        active_locks.insert(id.to_string(), json);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    
-    Ok(serde_json::Value::Object(active_locks))
+    sync_core::get_active_locks_inner(&project_path)
 }
 
 #[tauri::command]
