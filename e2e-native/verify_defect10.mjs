@@ -123,60 +123,91 @@ try {
   const bBlocked = await casSetTitle(pageB, "B_BLOCKED", "userB");
   rec("A 락 보유 중 B 저장이 ITEM_LOCKED로 차단됨(정상 보호)", !!bBlocked.locked, JSON.stringify(bBlocked).slice(0, 120));
 
-  // 3) A 락 만료 시뮬레이션(파일 삭제) 후 B 편집 성공 — A 하트비트 재생성 전에 B가 선점
-  log("[3] A 락 만료(파일 삭제) → B가 같은 필드 편집·저장...");
+  // 3) A 락 만료 시뮬레이션(파일 삭제) 후 B가 셀 편집 시작(아이템 락 획득)+저장.
+  //    B가 락을 실제로 보유해야 A의 하트비트 재획득이 실패 → [UX-1] 배너가 뜬다.
+  log("[3] A 락 만료 → B가 셀 편집 시작(락 획득) + 저장...");
   const B_VALUE = `B_VALUE_${Date.now()}`;
-  let bSaved = null;
+  let bLock = null, bSaved = null;
   for (let attempt = 0; attempt < 8; attempt++) {
     try { if (fs.existsSync(LOCK_FILE)) fs.rmSync(LOCK_FILE, { force: true }); } catch {}
-    bSaved = await casSetTitle(pageB, B_VALUE, "userB");
-    if (bSaved.ok) break;
+    bLock = await invokeRaw(pageB, "acquire_item_lock", { projectPath: SHARED, itemId: "requirements:REQ-001", userId: "userB", userName: "사용자B" });
+    if (bLock.ok && bLock.res === true) {
+      bSaved = await casSetTitle(pageB, B_VALUE, "userB");
+      if (bSaved.ok) break;
+    }
     await sleep(200);
   }
-  rec("락 만료 후 B의 편집 저장 성공", !!bSaved.ok, JSON.stringify(bSaved).slice(0, 120));
+  rec("락 만료 후 B가 셀 편집 시작(락 획득)+저장 성공", !!(bLock && bLock.ok) && !!(bSaved && bSaved.ok), JSON.stringify({ bLock: bLock?.res, bSaved: bSaved?.ok }).slice(0, 120));
 
-  // 4) A가 B의 변경을 전파받아 상태에 병합될 시간 부여(편집창은 여전히 열림·초안 표시)
-  log("[4] A 전파 대기(편집창 열린 채 상태만 B값으로 병합)...");
-  await sleep(5000);
+  // 4) A 전파 대기 — 편집창 열린 채 상태만 B값으로 병합. A의 하트비트가 B 선점을 감지 → 배너.
+  log("[4] A 전파 대기 + [UX-1] 락 만료 배너 확인...");
+  await sleep(7000); // A 하트비트(5s) 1회 이상 실패(B가 락 보유) → 배너
   const editorStillOpen = await pageA.evaluate(() => !!document.querySelector("#req-row-REQ-001 textarea"));
   const editorShows = await pageA.evaluate(() => document.querySelector("#req-row-REQ-001 textarea")?.value);
-  log(`  편집창 열림=${editorStillOpen}, 표시값='${editorShows}'`);
+  const bannerShown = await pageA.evaluate(() => document.body.innerText.includes("편집 잠금이 만료"));
+  log(`  편집창 열림=${editorStillOpen}, 표시값='${editorShows}', 락만료배너=${bannerShown}`);
+  rec("[UX-1] 편집 중 락 상실 시 만료 배너 표시", bannerShown);
+  // B가 편집 완료 → 락 해제(이제 A의 커밋 저장이 통과 가능)
+  await invokeRaw(pageB, "release_item_lock", { projectPath: SHARED, itemId: "requirements:REQ-001", userId: "userB" });
+  await sleep(600);
 
-  // 5) A가 편집창을 커밋(blur) → 옛 초안이 반영되는지
-  log("[5] A: 편집창 커밋(blur)...");
+  // 5) A가 편집창을 커밋(blur) → stale 선택 모달이 떠야 함(즉시 덮어쓰기 아님)
+  log("[5] A: 편집창 커밋(blur) → stale 선택 모달 등장 확인...");
   await pageA.evaluate(() => { const ta = document.querySelector("#req-row-REQ-001 textarea"); if (ta) ta.blur(); });
+  await sleep(1500);
+  const modalShown = await pageA.evaluate(() => document.body.innerText.includes("편집 충돌 — 다른 사용자가 먼저 변경"));
+  const titleDuringModal = fileTitle();
+  rec("[UX-2] stale 커밋 시 선택 모달 등장(즉시 덮어쓰기 안 함)", modalShown && titleDuringModal === B_VALUE, `모달=${modalShown}, 파일='${titleDuringModal}'`);
+
+  // 5a) 기본 선택 "다른 사용자 값 유지" → B값 보존
+  log("[5a] 모달: '다른 사용자 값 유지' 선택 → B값 보존 확인...");
+  await pageA.evaluate(() => {
+    const btn = [...document.querySelectorAll("button")].find((b) => (b.innerText || "").includes("다른 사용자 값 유지"));
+    if (btn) btn.click();
+  });
+  await sleep(2500);
+  const afterKeep = fileTitle();
+  rec("[결함#10 수정] '값 유지' 선택 시 B의 편집 보존(무통지 유실 없음)", afterKeep === B_VALUE, `최종='${afterKeep}'`);
+
+  // 5b) 반대 선택 검증 — 다시 stale을 만들어 '내 값으로 덮어쓰기'가 실제로 A값을 반영하는지
+  log("[5b] '내 값으로 덮어쓰기' 선택 경로 검증...");
+  // A가 다시 편집창 열고 초안 입력(미커밋)
+  await pageA.evaluate(() => {
+    const row = document.getElementById("req-row-REQ-001");
+    const cell = row && [...row.querySelectorAll("td")].find((td) => (td.textContent || "").includes("B_VALUE"));
+    if (cell) cell.click();
+  });
+  await sleep(800);
+  const A_DRAFT2 = `A_OVERWRITE_${Date.now()}`;
+  await pageA.evaluate((v) => {
+    const ta = document.querySelector("#req-row-REQ-001 textarea");
+    if (!ta) return; const s = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(ta), "value").set;
+    ta.focus(); s.call(ta, v); ta.dispatchEvent(new Event("input", { bubbles: true }));
+  }, A_DRAFT2);
+  // B가 또 다른 값으로 편집(락 삭제 후)
+  const B_VALUE2 = `B_VALUE2_${Date.now()}`;
+  for (let k = 0; k < 8; k++) { try { if (fs.existsSync(LOCK_FILE)) fs.rmSync(LOCK_FILE, { force: true }); } catch {} const r = await casSetTitle(pageB, B_VALUE2, "userB"); if (r.ok) break; await sleep(200); }
+  await sleep(5000);
+  await pageA.evaluate(() => { const ta = document.querySelector("#req-row-REQ-001 textarea"); if (ta) ta.blur(); });
+  await sleep(1500);
+  await pageA.evaluate(() => { const btn = [...document.querySelectorAll("button")].find((b) => (b.innerText || "").includes("내 값으로 덮어쓰기")); if (btn) btn.click(); });
   await sleep(3000);
-
-  const finalTitle = fileTitle();
-  const bLost = finalTitle === A_DRAFT;
-  const bKept = finalTitle === B_VALUE;
-  const aConflictModal = await pageA.evaluate(() => document.body.innerText.includes("충돌")).catch(() => false);
-  const aStaleNotice = aAlerted || aLog.some((l) => l.includes("STALE_EDIT") || l.includes("ALERT:"));
-  log(`  최종 제목='${finalTitle}' (A초안=${A_DRAFT} / B값=${B_VALUE})`);
-  log(`  A 충돌모달=${aConflictModal}, A stale 통지(alert/log)=${aStaleNotice}`);
-
-  // 판정: 결함이 수정됐다면 B값이 유실되지 않아야 함.
-  //  - 최선: B값 보존(A의 옛 초안 덮어쓰기 차단) + A에게 통지
-  //  - 허용: A초안이 반영되더라도 사용자에게 명시적 통지(무통지 유실만 아니면)
-  rec("[결함#10 수정] A의 옛 초안이 B의 편집을 무통지로 덮어쓰지 않음",
-    bKept && aStaleNotice ? true : (!bLost || aConflictModal || aStaleNotice),
-    bKept
-      ? (aStaleNotice ? "B값 보존 + A에게 통지(수정 확인)" : "B값 보존")
-      : (bLost ? (aStaleNotice ? "A초안 반영이나 통지됨" : "❗B값 무통지 유실(결함 재현)") : `기타(${finalTitle})`));
+  const afterForce = fileTitle();
+  rec("[UX-2] '내 값으로 덮어쓰기' 선택 시 A의 값이 반영됨(사용자 명시 선택)", afterForce === A_DRAFT2, `최종='${afterForce}'`);
 
   // 6) POSITIVE CONTROL — 원격 변경이 없는 정상 단일 편집은 stale 오탐 없이 정상 커밋되어야 함
   log("[6] positive control: 원격 변경 없는 정상 편집 커밋...");
   await sleep(1500); // 5단계 저장/렌더 정착 대기
   aAlerted = false;
   const NORMAL = `NORMAL_${Date.now()}`;
-  const pcOpen = await pageA.evaluate(() => {
+  const pcOpen = await pageA.evaluate((curTitle) => {
     const row = document.getElementById("req-row-REQ-001");
     if (!row) return { ok: false, why: "no-row" };
     const tds = [...row.querySelectorAll("td")];
-    const titleCell = tds.find((td) => (td.textContent || "").includes("B_VALUE"));
+    const titleCell = tds.find((td) => (td.textContent || "").includes(curTitle));
     if (!titleCell) return { ok: false, why: "no-title-cell", texts: tds.map((t) => (t.textContent || "").trim()).slice(0, 12) };
     titleCell.click(); return { ok: true };
-  });
+  }, fileTitle());
   await sleep(900);
   const pcSet = await pageA.evaluate((v) => {
     const ta = document.querySelector("#req-row-REQ-001 textarea");

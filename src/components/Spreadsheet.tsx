@@ -530,6 +530,10 @@ export default function Spreadsheet({
   // 편집 중 타 사용자가 같은 셀을 바꿨는지(stale) 판정한다.
   const editBaselineRef = useRef<{ rowId: string; field: string; value: any } | null>(null);
   const reqByIdRef = useRef<Map<string, any>>(new Map());
+  // [UX-1] 편집 중 하트비트 락 상실(연결 끊김/타인 선점) 감지 → 편집 중 배너 표시.
+  const [lockLost, setLockLost] = useState(false);
+  // [UX-2] stale 충돌 시 선택 모달: 내 입력 vs 상대 최신값 중 무엇을 남길지 사용자에게.
+  const [staleEdit, setStaleEdit] = useState<{ rowId: string; field: string; fieldLabel: string; myValue: any; currentValue: any } | null>(null);
 
   useEffect(() => {
     cellRef.current = activeCellEditor;
@@ -552,6 +556,7 @@ export default function Spreadsheet({
       // If closing, release the currently held lock
       if (val === null && activeCell) {
         editBaselineRef.current = null; // [결함 #10] 편집 종료 → 기준값 해제
+        setLockLost(false); // [UX-1] 편집 종료 → 만료 배너 해제
         // @ts-ignore
         if (
           (("__TAURI_INTERNALS__" in window) || ("__TAURI_IPC__" in window)) &&
@@ -573,6 +578,7 @@ export default function Spreadsheet({
       }
       // If opening, request lock from server
       if (val) {
+        setLockLost(false); // [UX-1] 새 편집 시작 → 이전 만료 상태 초기화
         // [결함 #10] 편집 시작 시점의 필드 값을 기준으로 저장(커밋 시 stale 판정).
         editBaselineRef.current = {
           rowId: val.rowId,
@@ -632,9 +638,11 @@ export default function Spreadsheet({
           userName: currentUser.name,
         });
       } catch (e) {
-        // [결함 #10] 하트비트 재획득 실패 = 락 상실(TTL 만료/네트워크/타인 선점).
-        // 데이터 안전은 커밋 시 stale 검사가 보장하지만, 관찰성을 위해 경고를 남긴다.
+        // [결함 #10 / UX-1] 하트비트 재획득 실패 = 락 상실(TTL 만료/네트워크/타인 선점).
+        // 데이터 안전은 커밋 시 stale 검사가 보장하지만, 사용자가 즉시 인지하도록
+        // 편집 중 배너를 띄우고(setLockLost) 경고 로그를 남긴다.
         console.warn("LOCK_LOST: 편집 중 락 갱신 실패 — 다른 사용자가 이 항목을 편집했을 수 있습니다.");
+        setLockLost(true);
       }
     }, 5000); // Send heartbeat every 5 seconds
 
@@ -1039,36 +1047,13 @@ export default function Spreadsheet({
   }, [selectedIds, setRequirements]);
 
   // 4. Update single field
-  const updateRequirementField = useCallback(
+  // [결함 #10] 실제 필드 쓰기(stale 검사 없이). stale 확인 후 "내 값으로 덮어쓰기"를
+  // 사용자가 선택했을 때도 이 경로로 강제 적용한다.
+  const applyFieldForce = useCallback(
     (rowId: string, field: string, value: any) => {
-      // [결함 #10 수정] 편집 중 stale 검사.
-      // A가 셀 편집창을 연 뒤 유휴한 사이 락이 만료되고 B가 같은 셀을 편집·저장하면,
-      // A의 편집창은 uncontrolled(defaultValue)라 화면엔 A의 옛 초안이 남지만 상태값은
-      // B의 값으로 병합돼 있다. 이때 A가 커밋하면 옛 초안이 B의 값을 조용히 덮어써
-      // B의 저장 내용이 무통지 유실됐다(재현: verify_defect10.mjs).
-      // → 커밋 시 "편집 시작 시점 기준값"과 "현재 상태값"을 비교해, 그 사이 값이
-      //   바뀌었고(=타인이 편집) 내가 그와 다른 값으로 덮어쓰려 하면, 덮어쓰기를 막고
-      //   A에게 통지한다(B의 값 보존, A는 최신값 확인 후 재편집).
-      const baseline = editBaselineRef.current;
-      if (baseline && baseline.rowId === rowId && baseline.field === field) {
-        const currentVal = getFieldValue(reqByIdRef.current.get(rowId), field);
-        const changedByOther = String(currentVal ?? "") !== String(baseline.value ?? "");
-        const iAmOverwriting = String(value ?? "") !== String(currentVal ?? "");
-        if (changedByOther && iAmOverwriting) {
-          console.warn(
-            `STALE_EDIT: '${field}' 항목이 편집 중 다른 사용자에 의해 변경됨 (기준='${baseline.value}' → 현재='${currentVal}'). 내 입력 '${value}'은 적용하지 않음(상대 값 보존).`,
-          );
-          editBaselineRef.current = null;
-          alert(
-            `편집하시던 항목이 그 사이 다른 사용자에 의해 변경되었습니다.\n\n최신 값: "${currentVal}"\n\n회원님의 입력은 적용하지 않았습니다. 최신 내용을 확인한 뒤 다시 편집해 주세요.`,
-          );
-          return; // 덮어쓰기 차단 — 상대(B)의 값 보존
-        }
-      }
       setRequirements((prev) =>
         prev.map((req) => {
           if (req.id === rowId) {
-            // Standard Columns
             if (field === "id") {
               if (prev.some((r) => r.id === value && r.id !== rowId)) {
                 alert("이미 존재하는 ID입니다.");
@@ -1077,12 +1062,9 @@ export default function Spreadsheet({
               return { ...req, id: value };
             }
             if (field === "title") return { ...req, title: value };
-            if (field === "priority")
-              return { ...req, priority: value as Priority };
+            if (field === "priority") return { ...req, priority: value as Priority };
             if (field === "status") return { ...req, status: value as Status };
             if (field === "dueDate") return { ...req, dueDate: value };
-
-            // Custom dynamic columns
             const updatedCustom = { ...req.customColumns, [field]: value };
             return { ...req, customColumns: updatedCustom };
           }
@@ -1091,6 +1073,37 @@ export default function Spreadsheet({
       );
     },
     [setRequirements],
+  );
+
+  const updateRequirementField = useCallback(
+    (rowId: string, field: string, value: any) => {
+      // [결함 #10 수정] 편집 중 stale 검사.
+      // A가 셀 편집창을 연 뒤 유휴한 사이 락이 만료되고 B가 같은 셀을 편집·저장하면,
+      // A의 편집창은 uncontrolled(defaultValue)라 화면엔 A의 옛 초안이 남지만 상태값은
+      // B의 값으로 병합돼 있다. 이때 A가 커밋하면 옛 초안이 B의 값을 조용히 덮어써
+      // B의 저장 내용이 무통지 유실됐다(재현: verify_defect10.mjs).
+      // → 커밋 시 "편집 시작 시점 기준값"과 "현재 상태값"을 비교해, 그 사이 값이
+      //   바뀌었고(=타인이 편집) 내가 그와 다른 값으로 덮어쓰려 하면, 즉시 덮어쓰지 않고
+      //   [UX-2] 선택 모달을 띄워 사용자가 "상대 값 유지" 또는 "내 값 덮어쓰기"를 고르게 한다.
+      const baseline = editBaselineRef.current;
+      if (baseline && baseline.rowId === rowId && baseline.field === field) {
+        const currentVal = getFieldValue(reqByIdRef.current.get(rowId), field);
+        const changedByOther = String(currentVal ?? "") !== String(baseline.value ?? "");
+        const iAmOverwriting = String(value ?? "") !== String(currentVal ?? "");
+        if (changedByOther && iAmOverwriting) {
+          console.warn(
+            `STALE_EDIT: '${field}' 항목이 편집 중 다른 사용자에 의해 변경됨 (기준='${baseline.value}' → 현재='${currentVal}'). 사용자 선택 대기.`,
+          );
+          editBaselineRef.current = null;
+          const fieldLabel =
+            columns.find((c) => c.id === field)?.label ?? field;
+          setStaleEdit({ rowId, field, fieldLabel, myValue: value, currentValue: currentVal });
+          return; // 사용자 선택 전까지 덮어쓰기 보류 — 상대(B)의 값 보존
+        }
+      }
+      applyFieldForce(rowId, field, value);
+    },
+    [applyFieldForce, columns],
   );
 
   // 5. Add or Edit Custom Column
@@ -2275,6 +2288,65 @@ export default function Spreadsheet({
 
   return (
     <div className="bg-brand-surface border border-brand-outline rounded-[2rem] shadow-xl overflow-hidden flex flex-col flex-1 min-h-[500px] animate-fade-slide-up delay-100">
+      {/* [UX-1] 편집 중 락 만료 배너 — 연결 끊김/타인 선점으로 락을 잃었을 때 즉시 알림 */}
+      {activeCellEditor && lockLost && (
+        <div className="px-5 py-2 bg-brand-error/10 border-b border-brand-error/40 flex items-center gap-2 text-[13px] text-brand-error font-medium">
+          <Lock className="w-4 h-4 shrink-0" />
+          <span>
+            편집 중 연결이 끊겨 편집 잠금이 만료되었습니다. 다른 사용자가 이 항목을
+            편집했을 수 있으니, 저장 전 최신 내용을 확인해 주세요.
+          </span>
+        </div>
+      )}
+
+      {/* [UX-2] stale 편집 선택 모달 — 편집 중 타인이 같은 셀을 바꿨을 때 사용자 선택 */}
+      {staleEdit &&
+        createPortal(
+          <div
+            className="fixed inset-0 z-[100] flex items-center justify-center bg-black/40"
+            onMouseDown={(e) => e.stopPropagation()}
+          >
+            <div className="bg-brand-surface border border-brand-outline-variant rounded-2xl shadow-2xl w-[440px] max-w-[92vw] p-6 animate-fade-in">
+              <div className="flex items-center gap-2 mb-3 text-brand-error">
+                <Lock className="w-5 h-5" />
+                <h3 className="text-base font-bold">편집 충돌 — 다른 사용자가 먼저 변경했습니다</h3>
+              </div>
+              <p className="text-[13px] text-brand-on-surface-variant mb-4">
+                편집하시던 <b>[{staleEdit.fieldLabel}]</b> 항목이 그 사이 다른 사용자에 의해
+                변경되었습니다. 어느 값을 남길지 선택해 주세요.
+              </p>
+              <div className="space-y-2 mb-5 text-[13px]">
+                <div className="p-3 rounded-lg bg-brand-surface-high border border-brand-outline-variant">
+                  <div className="text-[11px] text-brand-on-surface-variant mb-1">다른 사용자의 최신 값</div>
+                  <div className="font-mono break-all text-brand-on-surface">{String(staleEdit.currentValue ?? "(빈 값)")}</div>
+                </div>
+                <div className="p-3 rounded-lg bg-brand-surface-high border border-brand-outline-variant">
+                  <div className="text-[11px] text-brand-on-surface-variant mb-1">회원님이 입력한 값</div>
+                  <div className="font-mono break-all text-brand-on-surface">{String(staleEdit.myValue ?? "(빈 값)")}</div>
+                </div>
+              </div>
+              <div className="flex justify-end gap-2">
+                <button
+                  onClick={() => setStaleEdit(null)}
+                  className="px-4 py-2 rounded-lg text-[13px] font-semibold bg-brand-primary text-brand-on-primary hover:opacity-90 cursor-pointer"
+                >
+                  다른 사용자 값 유지(권장)
+                </button>
+                <button
+                  onClick={() => {
+                    applyFieldForce(staleEdit.rowId, staleEdit.field, staleEdit.myValue);
+                    setStaleEdit(null);
+                  }}
+                  className="px-4 py-2 rounded-lg text-[13px] font-semibold bg-brand-surface-high border border-brand-outline-variant text-brand-on-surface hover:bg-brand-surface-highest cursor-pointer"
+                >
+                  내 값으로 덮어쓰기
+                </button>
+              </div>
+            </div>
+          </div>,
+          document.body,
+        )}
+
       {/* 1. SpreadSheet Toolbar */}
       <div className="px-5 py-4 border-b border-brand-outline-variant bg-brand-surface-low flex flex-col sm:flex-row justify-between items-center gap-4">
         {/* Left Side Actions */}
