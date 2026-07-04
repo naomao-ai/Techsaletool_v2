@@ -149,7 +149,10 @@ const DEFAULT_TABS: TabItem[] = [
 
 export default function App() {
   const applyData = (parsed: any) => {
-    if (parsed.tabs) {
+    // [결함 #9 수정] tabs가 빈 배열이면(과거 병합 결함으로 오염된 파일 등) 적용하지 않고
+    // 기존/기본 탭을 유지 — 앱은 최소 1개 탭을 전제하며, UI상 모든 탭을 삭제하는 경로도
+    // 없으므로 빈 배열은 항상 손상 신호다. 다음 저장이 정상 tabs를 파일에 복원한다(자가 치유).
+    if (Array.isArray(parsed.tabs) && parsed.tabs.length > 0) {
       setTabs(
         parsed.tabs.map((t: TabItem) => {
           if (t.id === "ce_dashboard_example" && !t.ceDashboardConfigs) {
@@ -1264,8 +1267,11 @@ export default function App() {
             <BoardPage boardItems={boardItems} setBoardItems={setBoardItems} />
           ) : (
             (() => {
+              // [결함 #9 수정] tabs가 비어 있어도(오염된 공유 파일 등) 렌더가 크래시하지
+              // 않도록 기본 탭으로 폴백 — 크래시 대신 기본 화면을 보여주고, 다음 저장이
+              // 정상 tabs를 파일에 복원한다.
               const activeTabInfo =
-                tabs.find((t) => t.id === currentTab) || tabs[0];
+                tabs.find((t) => t.id === currentTab) || tabs[0] || DEFAULT_TABS[0];
               const tData = tabDataMap[currentTab] || {
                 requirements: [],
                 columns: DEFAULT_COLUMNS,
