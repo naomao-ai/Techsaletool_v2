@@ -1,0 +1,11 @@
+{
+  "capabilities": {
+    "alwaysMatch": {
+      "browserName": "webview2",
+      "ms:edgeOptions": {
+        "binary": "C:\01.claude\Techsaletool_v2\src-tauri\target\x86_64-pc-windows-gnu\release\business-requirements.exe",
+        "args": []
+      }
+    }
+  }
+}

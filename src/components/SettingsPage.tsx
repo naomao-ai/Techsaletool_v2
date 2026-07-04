@@ -61,6 +61,18 @@ export default function SettingsPage({ onConfigSaved }: SettingsPageProps) {
     try {
       localStorage.setItem("app_config", JSON.stringify(config));
 
+      // @ts-ignore
+      const isTauri = !!(window.__TAURI_INTERNALS__ || window.__TAURI_IPC__);
+      if (isTauri && config.activeDataPath) {
+        // @ts-ignore
+        const { invoke } = await import("@tauri-apps/api/core");
+        // Rust 측 get_server_config가 참조하는 server_config.json에도 반영해
+        // 다음 실행 시 설정화면으로 강제 전환되지 않도록 한다.
+        await invoke("update_server_config", {
+          activePath: config.activeDataPath,
+        }).catch((e: any) => console.warn("Failed to persist server config to Rust side:", e));
+      }
+
       setSaveMessage({
         type: "success",
         text: "설정이 성공적으로 저장되었습니다. 데스크톱 앱일 경우 부분 재시작이 필요할 수 있습니다.",

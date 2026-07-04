@@ -31,6 +31,7 @@ import {
   CE_EXAMPLE_REQUIREMENTS,
   CE_EXAMPLE_COLUMNS,
 } from "./data";
+import { computeSmartMerge } from "./lib/mergeEngine";
 import { io, Socket } from "socket.io-client";
 import {
   Sparkles,
@@ -362,6 +363,8 @@ export default function App() {
   const [dbPath, setDbPath] = useState<string>("");
   const [serverUrl, setServerUrl] = useState<string>("");
   const [syncError, setSyncError] = useState<string | null>(null);
+  // 결함#3 수정: mtime이 아니라 파일 payload 루트의 단조 증가 `_rev` 카운터를 보관한다.
+  // save_data 호출 시 expectedRev로 전달되며, 서버 현재 _rev와 다르면 VERSION_CONFLICT.
   const lastSaveRef = useRef<number>(0);
 
   const [socket, setSocket] = useState<Socket | null>(null);
@@ -387,6 +390,7 @@ export default function App() {
       const response: any = await invoke("read_data", { path: serverPath });
       const theirData = response.data;
       if (!theirData) return;
+      const theirRev = response.rev ?? 0;
 
       let baseData;
       try {
@@ -396,216 +400,19 @@ export default function App() {
       }
 
       const myData = statesRef.current;
-      const conflicts: any[] = [];
-      const mergedMap: Record<string, TabData> = {};
-
-      // Merge tabs array to prevent losing concurrently added tabs
-      let finalTabs = [...(baseData.tabs || [])];
-      const baseTabIds = finalTabs.map((t) => t.id);
-      
-      // Add their new tabs and apply their edits
-      (theirData.tabs || []).forEach((theirT: any) => {
-        const idx = finalTabs.findIndex((t) => t.id === theirT.id);
-        if (idx === -1) finalTabs.push(theirT);
-        else finalTabs[idx] = { ...finalTabs[idx], ...theirT };
-      });
-      
-      // Add my new tabs and apply my edits
-      (myData.tabs || []).forEach((myT: any) => {
-        const idx = finalTabs.findIndex((t) => t.id === myT.id);
-        if (idx === -1) finalTabs.push(myT);
-        else {
-          const baseT = baseData.tabs?.find((t: any) => t.id === myT.id);
-          // If I changed the tab config, override theirs
-          if (JSON.stringify(baseT) !== JSON.stringify(myT)) {
-             finalTabs[idx] = { ...finalTabs[idx], ...myT };
-          }
-        }
-      });
-      
-      // Remove tabs deleted by either
-      finalTabs = finalTabs.filter(t => {
-         const inBase = baseTabIds.includes(t.id);
-         const deletedByThem = inBase && !(theirData.tabs || []).find((x: any) => x.id === t.id);
-         const deletedByMe = inBase && !(myData.tabs || []).find((x: any) => x.id === t.id);
-         return !(deletedByThem || deletedByMe);
-      });
-
-      Object.keys({ ...theirData.tabDataMap, ...myData.tabDataMap }).forEach(
-        (tabId) => {
-          const myTab = myData.tabDataMap[tabId] || {
-            requirements: [],
-            columns: DEFAULT_COLUMNS,
-          };
-          const theirTab = theirData.tabDataMap?.[tabId] || {
-            requirements: [],
-            columns: DEFAULT_COLUMNS,
-          };
-          const baseTab = baseData.tabDataMap?.[tabId] || {
-            requirements: [],
-            columns: DEFAULT_COLUMNS,
-          };
-
-          const mergedReqs = [...theirTab.requirements];
-          let mergedCols = [...(baseTab.columns || [])];
-          const baseColIds = mergedCols.map((c: any) => c.id);
-          const theirColIds = (theirTab.columns || []).map((c: any) => c.id);
-          const myColIds = (myTab.columns || []).map((c: any) => c.id);
-
-          // Apply their changes
-          theirTab.columns?.forEach((tc: any) => {
-            const idx = mergedCols.findIndex((c) => c.id === tc.id);
-            if (idx === -1) mergedCols.push(tc);
-            else mergedCols[idx] = { ...mergedCols[idx], ...tc };
-          });
-
-          // Apply my changes
-          myTab.columns?.forEach((mc: any) => {
-            const idx = mergedCols.findIndex((c) => c.id === mc.id);
-            if (idx === -1) mergedCols.push(mc);
-            else {
-              // If I changed it from base, apply my change (my changes win on columns for simplicity unless we want column conflicts)
-              const baseCol = baseTab.columns?.find((c: any) => c.id === mc.id);
-              if (JSON.stringify(baseCol) !== JSON.stringify(mc)) {
-                mergedCols[idx] = { ...mergedCols[idx], ...mc };
-              }
-            }
-          });
-
-          // Remove deleted columns
-          mergedCols = mergedCols.filter((c) => {
-            const inBase = baseColIds.includes(c.id);
-            const deletedByThem = inBase && !theirColIds.includes(c.id);
-            const deletedByMe = inBase && !myColIds.includes(c.id);
-            return !(deletedByThem || deletedByMe);
-          });
-
-          myTab.requirements.forEach((myReq) => {
-            const baseReq = baseTab.requirements.find(
-              (r: any) => r.id === myReq.id,
-            );
-            const theirReqIndex = mergedReqs.findIndex(
-              (r: any) => r.id === myReq.id,
-            );
-
-            if (!baseReq) {
-              if (theirReqIndex === -1) {
-                mergedReqs.push(myReq);
-              } else {
-                // Duplicate ID collision
-                let maxNumericId = mergedReqs.reduce((max, r) => {
-                  const match = String(r.id).match(/REQ-(\d+)/);
-                  return match ? Math.max(max, parseInt(match[1], 10)) : max;
-                }, 0);
-                const nextId = `REQ-${String(maxNumericId + 1).padStart(3, "0")}`;
-                mergedReqs.push({ ...myReq, id: nextId });
-              }
-            } else {
-              if (theirReqIndex !== -1) {
-                const theirReq = mergedReqs[theirReqIndex];
-                const mergedReq = {
-                  ...theirReq,
-                  customColumns: { ...theirReq.customColumns },
-                };
-                const fields = ["title", "priority", "status", "dueDate"];
-
-                fields.forEach((f) => {
-                  if (
-                    myReq[f as keyof Requirement] !==
-                    baseReq[f as keyof Requirement]
-                  ) {
-                    if (
-                      theirReq[f as keyof Requirement] !==
-                        baseReq[f as keyof Requirement] &&
-                      myReq[f as keyof Requirement] !==
-                        theirReq[f as keyof Requirement]
-                    ) {
-                      conflicts.push({
-                        reqId: myReq.id,
-                        field: f,
-                        mine: myReq[f as keyof Requirement],
-                        theirs: theirReq[f as keyof Requirement],
-                        tabId,
-                      });
-                    } else {
-                      (mergedReq as any)[f] = myReq[f as keyof Requirement];
-                    }
-                  }
-                });
-
-                if (myReq.customColumns) {
-                  Object.keys(myReq.customColumns).forEach((colId) => {
-                    const myVal = myReq.customColumns[colId];
-                    const baseVal = baseReq.customColumns?.[colId];
-                    const theirVal = theirReq.customColumns?.[colId];
-                    if (myVal !== baseVal) {
-                      if (theirVal !== baseVal && myVal !== theirVal) {
-                        conflicts.push({
-                          reqId: myReq.id,
-                          field: `customColumns.${colId}`,
-                          mine: myVal,
-                          theirs: theirVal,
-                          tabId,
-                        });
-                      } else {
-                        if (!mergedReq.customColumns)
-                          mergedReq.customColumns = {};
-                        mergedReq.customColumns[colId] = myVal;
-                      }
-                    }
-                  });
-                }
-
-                if (
-                  JSON.stringify(myReq.assignees) !==
-                  JSON.stringify(baseReq.assignees)
-                ) {
-                  if (
-                    JSON.stringify(theirReq.assignees) !==
-                      JSON.stringify(baseReq.assignees) &&
-                    JSON.stringify(myReq.assignees) !==
-                      JSON.stringify(theirReq.assignees)
-                  ) {
-                    conflicts.push({
-                      reqId: myReq.id,
-                      field: "assignees",
-                      mine: myReq.assignees.map((a) => a.name).join(","),
-                      theirs: theirReq.assignees.map((a) => a.name).join(","),
-                      tabId,
-                    });
-                  } else {
-                    mergedReq.assignees = myReq.assignees;
-                  }
-                }
-
-                mergedReqs[theirReqIndex] = mergedReq;
-              }
-            }
-          });
-
-          const mergedTabConfig = { ...theirTab };
-          Object.keys(myTab).forEach((key) => {
-            if (key === "requirements" || key === "columns") return;
-            if (JSON.stringify(myTab[key as keyof typeof myTab]) !== JSON.stringify(baseTab[key as keyof typeof baseTab])) {
-              mergedTabConfig[key] = myTab[key as keyof typeof myTab];
-            }
-          });
-
-          mergedMap[tabId] = { ...mergedTabConfig, requirements: mergedReqs, columns: mergedCols };
-        },
+      // 3-way 병합 코어는 src/lib/mergeEngine.ts로 추출됨 (단위 테스트 대상).
+      // 부수효과(setState/save_data)는 아래에 그대로 남는다.
+      const { mergedPayload, conflicts } = computeSmartMerge(
+        baseData,
+        myData,
+        theirData,
       );
-
-      const mergedPayload = {
-        ...theirData,
-        tabDataMap: mergedMap,
-        tabs: finalTabs,
-      };
 
       if (conflicts.length > 0) {
         setConflictDetails(conflicts);
         setPendingMergeData({
           mergedData: mergedPayload,
-          version: response.lastModified,
+          version: theirRev,
         });
         setShowConflictModal(true);
       } else {
@@ -631,7 +438,7 @@ export default function App() {
         if (mergedPayload.assigneesPool) setAssigneesPool(mergedPayload.assigneesPool);
 
         if (normalizedMergedPayloadStr === normalizedTheirDataStr) {
-          lastSaveRef.current = response.lastModified;
+          lastSaveRef.current = theirRev;
           lastSavedPayload.current = normalizedTheirDataStr;
           return;
         }
@@ -645,14 +452,15 @@ export default function App() {
           const modifiedId: any = await invoke("save_data", {
             path: serverPath,
             data: payloadStr,
-            expectedVersion: response.lastModified,
+            expectedRev: theirRev,
+            userId: currentUser.id,
           });
           lastSaveRef.current = Number(modifiedId);
           lastSavedPayload.current = payloadStr;
         } catch (e) {
           console.error("Merge save failed:", e);
           // Update it locally anyway, wait for next heartbeat to fix discrepancy
-          lastSaveRef.current = response.lastModified;
+          lastSaveRef.current = theirRev;
           lastSavedPayload.current = payloadStr;
         }
       }
@@ -819,7 +627,6 @@ export default function App() {
           setDbPath(config.activeDataPath);
           await fetchData(config.activeDataPath);
         } else {
-          localStorage.removeItem("offline_db");
           const localDataStr = localStorage.getItem("offline_db");
           if (localDataStr) {
             const parsed = JSON.parse(localDataStr);
@@ -876,7 +683,7 @@ export default function App() {
           const { listen: tListen } = await import("@tauri-apps/api/event");
           const response: any = await invoke("read_data", { path: fetchPath });
           parsed = response.data;
-          lastSaveRef.current = response.lastModified || 0;
+          lastSaveRef.current = response.rev ?? 0;
 
           // Start watcher and listen for changes
           await invoke("start_file_watcher", { path: fetchPath });
@@ -886,12 +693,12 @@ export default function App() {
             "shared-file-changed",
             async (e: any) => {
               if (e.payload === fetchPath) {
-                // Compare modification dates to see if it's someone else
+                // _rev가 내가 아는 것보다 커졌으면 타인이 저장한 것 (mtime 오차창 불필요)
                 try {
                   const check: any = await invoke("read_data", {
                     path: fetchPath,
                   });
-                  if (check.lastModified > lastSaveRef.current + 500) {
+                  if ((check.rev ?? 0) > lastSaveRef.current) {
                     // File was modified externally! Evaluate cell-level smart merge
                     await executeSmartMerge(fetchPath);
                   }
@@ -992,7 +799,8 @@ export default function App() {
             const newModified: any = await invoke("save_data", {
               path: dbPath,
               data: newPayload,
-              expectedVersion: lastSaveRef.current || 0,
+              expectedRev: lastSaveRef.current ?? 0,
+              userId: currentUser.id,
             });
             if (newModified) lastSaveRef.current = newModified;
 
@@ -1010,6 +818,11 @@ export default function App() {
             if (String(e).includes("VERSION_CONFLICT")) {
               await executeSmartMerge(dbPath);
               return; // Early return to prevent overwriting lastSavedPayload with conflicting data
+            } else if (String(e).includes("ITEM_LOCKED")) {
+              // 결함#4 수정: 타 사용자가 편집 중인 항목이 있어 저장이 거부됨.
+              // lastSavedPayload를 갱신하지 않아 다음 상태 변경 시 자동 재시도된다.
+              setSyncError("다른 사용자가 편집 중인 항목이 있어 저장이 보류되었습니다. 편집이 끝나면 자동으로 다시 저장됩니다.");
+              return;
             } else {
               throw e;
             }
@@ -1090,14 +903,15 @@ export default function App() {
 
       if (filePath) {
         // 기존 plugin-fs가 아닌 Rust 백엔드의 안전한 Atomic Save 기능을 호출 (동시성 및 백업 지원)
+        // 새로운 'Save As' 대상 경로이므로 expectedRev 0(=파일 없음/최초 저장)으로 저장.
         const newModified: any = await invoke("save_data", {
           path: filePath,
           data: dataPayload,
-          // Use expectedVersion 0 to force overwrite for a new 'Save As' destination
-          expectedVersion: 0,
+          expectedRev: 0,
+          userId: currentUser.id,
         });
 
-        lastSaveRef.current = Number(newModified) || Date.now();
+        lastSaveRef.current = Number(newModified);
         lastSavedPayload.current = dataPayload;
 
         const configStr = localStorage.getItem("app_config");
@@ -1122,7 +936,7 @@ export default function App() {
                   const check: any = await invoke("read_data", {
                     path: filePath,
                   });
-                  if (check.lastModified > lastSaveRef.current + 500) {
+                  if ((check.rev ?? 0) > lastSaveRef.current) {
                     await executeSmartMerge(filePath);
                   }
                 } catch (err) {
@@ -1205,7 +1019,7 @@ export default function App() {
         );
         setDbPath(filePath);
 
-        lastSaveRef.current = response.lastModified || Date.now();
+        lastSaveRef.current = response.rev ?? 0;
 
         // Restart the file watcher
         try {
@@ -1223,7 +1037,7 @@ export default function App() {
                   const check: any = await invoke("read_data", {
                     path: filePath,
                   });
-                  if (check.lastModified > lastSaveRef.current + 500) {
+                  if ((check.rev ?? 0) > lastSaveRef.current) {
                     await executeSmartMerge(filePath);
                   }
                 } catch (err) {
@@ -1830,16 +1644,25 @@ export default function App() {
 
             setShowConflictModal(false);
             if (strategy === "mine") {
-              // Forced overwrite
+              // 강제 덮어쓰기: 저장 직전 현재 파일의 최신 rev를 다시 읽어 그 rev로 저장한다.
+              // (참고: 예전 mtime 체계에서 expectedVersion:0은 파일이 이미 존재하면 mtime이
+              //  항상 500ms보다 크므로 매번 VERSION_CONFLICT로 조용히 실패하던 결함이 있었음 —
+              //  이번 _rev 전환 과정에서 함께 수정.)
               if (dataPayload === lastSavedPayload.current) return; // Bypass double save block
               const { invoke } = await import("@tauri-apps/api/core");
-              const newModified: any = await invoke("save_data", {
-                path: dbPath,
-                data: dataPayload,
-                expectedVersion: 0,
-              });
-              lastSaveRef.current = Number(newModified);
-              lastSavedPayload.current = dataPayload;
+              try {
+                const current: any = await invoke("read_data", { path: dbPath });
+                const newModified: any = await invoke("save_data", {
+                  path: dbPath,
+                  data: dataPayload,
+                  expectedRev: current.rev ?? 0,
+                  userId: currentUser.id,
+                });
+                lastSaveRef.current = Number(newModified);
+                lastSavedPayload.current = dataPayload;
+              } catch (e) {
+                console.error("Force overwrite save failed:", e);
+              }
             } else if (strategy === "theirs") {
               // Reload
               const { invoke } = await import("@tauri-apps/api/core");
@@ -1849,7 +1672,7 @@ export default function App() {
                 applyData(parsed);
                 lastSavedPayload.current = JSON.stringify(parsed);
               }
-              lastSaveRef.current = response.lastModified || 0;
+              lastSaveRef.current = response.rev ?? 0;
             } else {
               // Use pending smart merge data!
               if (pendingMergeData) {
@@ -1897,7 +1720,8 @@ export default function App() {
                   const modifiedId = await invoke("save_data", {
                     path: dbPath,
                     data: payload,
-                    expectedVersion: version,
+                    expectedRev: version,
+                    userId: currentUser.id,
                   });
                   lastSaveRef.current = Number(modifiedId);
                 } catch (e) {

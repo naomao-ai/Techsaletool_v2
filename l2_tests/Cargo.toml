@@ -1,0 +1,11 @@
+# L2 동시성 테스트 전용 독립 크레이트.
+# src-tauri의 tauri-build(build.rs)를 거치지 않아 parking_lot/dlltool 의존을 회피한다.
+# sync_core.rs 원본을 #[path]로 포함하므로 코드 중복(drift) 없이 실제 로직을 테스트한다.
+[package]
+name = "l2_tests"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+serde_json = "1.0"
