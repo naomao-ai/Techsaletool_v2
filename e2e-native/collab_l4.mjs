@@ -240,7 +240,7 @@ try {
     const preConflictLogCount = consoleLog.length;
     const mA = `A_${Date.now()}`, mB = `B_${Date.now()}`;
     await Promise.all([setInputByPlaceholder(pageA, TITLE_PH, mA), setInputByPlaceholder(pageB, TITLE_PH, mB)]);
-    await sleep(5000);
+    await sleep(8000);
     const finalFile = (() => { try { return fs.readFileSync(SHARED_PATH_FOR_APP, "utf-8"); } catch { return ""; } })();
     const keptA = finalFile.includes(mA), keptB = finalFile.includes(mB);
     const conflictA = await pageA.evaluate(() => document.body.innerText.includes("충돌")).catch(() => false);
@@ -252,26 +252,42 @@ try {
     rec("충돌 시나리오 최종 결과(정보성, NAS 경로)", true, observed);
 
     // 8) 결함#4 수정 확인: NAS 경로에서도 아이템 락 보유 항목 저장이 ITEM_LOCKED로 거부되는지
+    // 결함#4 검증은 rev CAS 통과가 전제라, 배경에서 진행 중인 자동저장(디바운스)·병합
+    // 재시도로 rev가 계속 움직이는 동안에는 무관한 VERSION_CONFLICT로 오탐할 수 있다.
+    // 그래서 저장 시도 직전에 매번 rev를 새로 읽고, 우연한 VERSION_CONFLICT는 재시도한다.
     log("[8] 결함#4 검증: NAS 경로에서 아이템 락 vs save_data...");
-    const baseRead = await invokeRaw(pageA, "read_data", { path: SHARED_PATH_FOR_APP });
-    const baseRev = baseRead.ok ? (baseRead.res.rev ?? 0) : 0;
     const lockAcq2 = await invokeRaw(pageA, "acquire_item_lock", {
       projectPath: SHARED_PATH_FOR_APP, itemId: "REQ-LOCK-TEST-L4", userId: "userA", userName: "사용자A",
     });
     rec("A가 NAS 경로에서 REQ-LOCK-TEST-L4 락 획득", lockAcq2.ok && lockAcq2.res === true);
 
     const conflictingPayload = JSON.stringify({ tabDataMap: { t_locktest: { requirements: [{ id: "REQ-LOCK-TEST-L4", title: "B가 덮어쓰기 시도" }] } } });
-    const bSaveAttempt = await invokeRaw(pageB, "save_data", {
-      path: SHARED_PATH_FOR_APP, data: conflictingPayload, expectedRev: baseRev, userId: "userB",
-    });
+    let bSaveAttempt = null;
+    for (let i = 0; i < 5; i++) {
+      const fresh = await invokeRaw(pageA, "read_data", { path: SHARED_PATH_FOR_APP });
+      const freshRev = fresh.ok ? (fresh.res.rev ?? 0) : 0;
+      bSaveAttempt = await invokeRaw(pageB, "save_data", {
+        path: SHARED_PATH_FOR_APP, data: conflictingPayload, expectedRev: freshRev, userId: "userB",
+      });
+      if (!bSaveAttempt.ok && String(bSaveAttempt.error).includes("ITEM_LOCKED")) break;
+      if (!bSaveAttempt.ok && String(bSaveAttempt.error).includes("VERSION_CONFLICT")) { await sleep(1000); continue; } // 배경 저장으로 rev가 움직인 것 — 재시도
+      break;
+    }
     rec("[결함#4 수정 확인] NAS 경로에서도 락 보유 항목 저장 시도가 ITEM_LOCKED로 거부됨",
       !bSaveAttempt.ok && String(bSaveAttempt.error).includes("ITEM_LOCKED:REQ-LOCK-TEST-L4"),
       JSON.stringify(bSaveAttempt));
 
     await invokeRaw(pageA, "release_item_lock", { projectPath: SHARED_PATH_FOR_APP, itemId: "REQ-LOCK-TEST-L4", userId: "userA" });
-    const bRetry = await invokeRaw(pageB, "save_data", {
-      path: SHARED_PATH_FOR_APP, data: conflictingPayload, expectedRev: baseRev, userId: "userB",
-    });
+    let bRetry = null;
+    for (let i = 0; i < 5; i++) {
+      const fresh = await invokeRaw(pageA, "read_data", { path: SHARED_PATH_FOR_APP });
+      const freshRev = fresh.ok ? (fresh.res.rev ?? 0) : 0;
+      bRetry = await invokeRaw(pageB, "save_data", {
+        path: SHARED_PATH_FOR_APP, data: conflictingPayload, expectedRev: freshRev, userId: "userB",
+      });
+      if (bRetry.ok || !String(bRetry.error).includes("VERSION_CONFLICT")) break;
+      await sleep(1000);
+    }
     rec("락 해제 후 B의 동일 저장은 NAS 경로에서도 성공함", bRetry.ok, JSON.stringify(bRetry));
   }
 } catch (e) {

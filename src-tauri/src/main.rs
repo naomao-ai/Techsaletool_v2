@@ -15,6 +15,8 @@ use business_requirements_lib::sync_core;
 
 struct AppState {
     write_lock: Mutex<()>,
+    // 결함#7 수정: start_file_watcher가 같은 경로에 대해 중복 스레드를 스폰하는 것을 막는다.
+    watched_paths: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 // ① 파일 읽기 명령 — 공유 폴더 JSON 로드 및 .bak 자동 복구 (sync_core에 위임)
@@ -39,13 +41,41 @@ async fn save_data(path: String, data: String, expected_rev: u64, user_id: Optio
 }
 
 // ③ File Watcher
+// 결함#7 수정(2026-07-03): 이 커맨드는 initServer/fetchData가 mount·reload·파일 열기마다
+// 무조건 재호출한다. 기존에는 매 호출마다 새 감시 스레드+notify::Watcher를 무조건 스폰해
+// 같은 경로에 대한 감시 스레드가 재로드 때마다 누적됐다(리소스 누수). 같은 경로를 이미
+// 감시 중이면 새 스레드를 스폰하지 않고 즉시 성공 반환하도록 방지한다.
+//
+// 결함#7-b(핵심 원인, 2026-07-03): 기존에는 대상 **파일 자체**를 `NonRecursive`로 watch했다.
+// 그런데 `save_data`는 원자적 쓰기를 위해 tmp 파일을 쓴 뒤 `rename()`으로 덮어쓴다 — rename은
+// 기존 파일 핸들/inode를 새 것으로 교체하는 작업이라, 파일 자체에 바인딩된 watch가 **첫 rename
+// 이후 조용히 끊길 수 있다**(운영체제/파일시스템에 따라). 그 결과 이후의 변경은 감시자가
+// 감지하지 못해 "다른 사용자의 저장이 전파되지 않는" 결함으로 나타난다(L3/L4 E2E 재실행 중
+// "B가 A 변경을 전파받지 못함"으로 재현). **수정: 파일이 아니라 부모 디렉터리를 watch**하고,
+// 이벤트의 대상 경로들 중 우리가 감시하려는 파일이 포함된 경우에만 반응하도록 필터링한다
+// (rename-지속형 파일 감시의 표준 해법 — 디렉터리 자체는 rename으로 사라지지 않으므로 watch가
+// 끊기지 않는다).
 #[tauri::command]
-async fn start_file_watcher(path: String, window: tauri::Window) -> Result<(), String> {
+async fn start_file_watcher(path: String, window: tauri::Window, state: State<'_, AppState>) -> Result<(), String> {
+    {
+        let mut watched = state.watched_paths.lock().unwrap();
+        if watched.contains(&path) {
+            return Ok(());
+        }
+        watched.insert(path.clone());
+    }
     std::thread::spawn(move || {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
         use std::time::Duration;
-        
+
+        let target_path = Path::new(&path);
+        let watch_dir = match target_path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+            _ => Path::new(".").to_path_buf(),
+        };
+        let target_file_name = target_path.file_name().map(|n| n.to_os_string());
+
         let (tx, rx) = mpsc::channel();
         let mut watcher = match notify::recommended_watcher(tx) {
             Ok(w) => w,
@@ -55,19 +85,24 @@ async fn start_file_watcher(path: String, window: tauri::Window) -> Result<(), S
                 return;
             }
         };
-        
-        if let Err(e) = watcher.watch(Path::new(&path), notify::RecursiveMode::NonRecursive) {
+
+        if let Err(e) = watcher.watch(&watch_dir, notify::RecursiveMode::NonRecursive) {
             let mut file = std::fs::OpenOptions::new().create(true).append(true).open("tauri_crash.log").unwrap();
             let _ = writeln!(file, "[{}] Watch Error for {}: {}", chrono::Local::now(), path, e);
             return;
         }
-        
+
         let mut last_hash = 0;
         let mut last_emit = std::time::Instant::now();
-        
+
         for event in rx {
             if let Ok(e) = event {
-                if matches!(e.kind, notify::EventKind::Modify(_)) {
+                if matches!(e.kind, notify::EventKind::Modify(_) | notify::EventKind::Create(_)) {
+                    // 디렉터리 전체를 watch하므로, 우리가 감시하려는 파일과 무관한 이벤트는 무시.
+                    let matches_target = e.paths.iter().any(|p| p.file_name() == target_file_name.as_deref());
+                    if !matches_target {
+                        continue;
+                    }
                     if last_emit.elapsed() < Duration::from_millis(100) {
                         continue; // Throttling: 100ms
                     }
@@ -75,7 +110,7 @@ async fn start_file_watcher(path: String, window: tauri::Window) -> Result<(), S
                         let mut hasher = DefaultHasher::new();
                         content.hash(&mut hasher);
                         let hash = hasher.finish();
-                        
+
                         if hash != last_hash {
                             last_hash = hash;
                             last_emit = std::time::Instant::now();
@@ -423,6 +458,7 @@ fn main() {
         .plugin(tauri_plugin_fs::init())
         .manage(AppState {
             write_lock: Mutex::new(()),
+            watched_paths: std::sync::Mutex::new(std::collections::HashSet::new()),
         })
         .invoke_handler(tauri::generate_handler![
             read_data,

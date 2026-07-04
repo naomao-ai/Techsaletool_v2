@@ -103,6 +103,20 @@ async function onboard(page, tag) {
     localStorage.setItem("app_config", JSON.stringify(cfg));
   }, { dataPath: SHARED_PATH_FOR_APP, exportDir: EXPORT_DIR_FOR_APP });
 
+  // 결함#5 수정 이후 Rust 측 server_config.json(%APPDATA%\com.business.requirements\data\,
+  // 머신 전역·이전 L4 실행 등 다른 세션과도 공유됨)이 남아있으면 rawConfig가 activeDataPath를
+  // 항상 덮어써 localStorage 주입이 무시된다(§6.5/§7.4에서 확인된 테스트 하네스 함정).
+  // 이 스크립트도 매번 update_server_config로 명시 동기화해 항상 이 파일을 보도록 고정한다.
+  const cfgSync = await page.evaluate(async (dataPath) => {
+    try {
+      await window.__TAURI_INTERNALS__.invoke("update_server_config", { activePath: dataPath });
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, error: String(e) };
+    }
+  }, SHARED_PATH_FOR_APP);
+  log(`  [${tag}] Rust 측 update_server_config 동기화=${JSON.stringify(cfgSync)}`);
+
   await page.reload({ waitUntil: "domcontentloaded" });
   await page.waitForSelector("#sidebar-container", { timeout: 30000 });
   await sleep(3000); // initServer 이펙트(get_server_config/convert_to_unc_path/read_data invoke) 완료 대기
@@ -196,7 +210,7 @@ try {
     const preConflictLogCount = consoleLog.length;
     const mA = `A_${Date.now()}`, mB = `B_${Date.now()}`;
     await Promise.all([setInputByPlaceholder(pageA, TITLE_PH, mA), setInputByPlaceholder(pageB, TITLE_PH, mB)]);
-    await sleep(5000);
+    await sleep(8000);
     const finalFile = (() => { try { return fs.readFileSync(SHARED, "utf-8"); } catch { return ""; } })();
     const keptA = finalFile.includes(mA), keptB = finalFile.includes(mB);
     const conflictA = await pageA.evaluate(() => document.body.innerText.includes("충돌")).catch(() => false);
@@ -212,26 +226,42 @@ try {
     rec("충돌 시나리오 최종 결과(정보성)", true, observed);
 
     // 6) 결함#4 수정 확인: 아이템 락 보유 중인 요구항목을 건드리는 저장은 ITEM_LOCKED로 거부되어야 함
+    // rev CAS 통과가 전제이므로, 배경 자동저장/병합 재시도로 rev가 계속 바뀌는 동안에는
+    // 무관한 VERSION_CONFLICT로 오탐할 수 있다 — 시도 직전마다 rev를 새로 읽고, 우연한
+    // VERSION_CONFLICT는 재시도해 실제 락 차단(ITEM_LOCKED) 여부만 정확히 검증한다.
     log("[6] 결함#4 검증: 아이템 락 vs save_data(direct invoke)...");
-    const baseRead = await invokeRaw(pageA, "read_data", { path: SHARED_PATH_FOR_APP });
-    const baseRev = baseRead.ok ? (baseRead.res.rev ?? 0) : 0;
     const lockAcq = await invokeRaw(pageA, "acquire_item_lock", {
       projectPath: SHARED_PATH_FOR_APP, itemId: "REQ-LOCK-TEST", userId: "userA", userName: "사용자A",
     });
     rec("A가 REQ-LOCK-TEST 락 획득", lockAcq.ok && lockAcq.res === true);
 
     const conflictingPayload = JSON.stringify({ tabDataMap: { t_locktest: { requirements: [{ id: "REQ-LOCK-TEST", title: "B가 덮어쓰기 시도" }] } } });
-    const bSaveAttempt = await invokeRaw(pageB, "save_data", {
-      path: SHARED_PATH_FOR_APP, data: conflictingPayload, expectedRev: baseRev, userId: "userB",
-    });
+    let bSaveAttempt = null;
+    for (let i = 0; i < 5; i++) {
+      const fresh = await invokeRaw(pageA, "read_data", { path: SHARED_PATH_FOR_APP });
+      const freshRev = fresh.ok ? (fresh.res.rev ?? 0) : 0;
+      bSaveAttempt = await invokeRaw(pageB, "save_data", {
+        path: SHARED_PATH_FOR_APP, data: conflictingPayload, expectedRev: freshRev, userId: "userB",
+      });
+      if (!bSaveAttempt.ok && String(bSaveAttempt.error).includes("ITEM_LOCKED")) break;
+      if (!bSaveAttempt.ok && String(bSaveAttempt.error).includes("VERSION_CONFLICT")) { await sleep(1000); continue; }
+      break;
+    }
     rec("[결함#4 수정 확인] B가 락 보유 항목을 건드리는 저장 시도 → ITEM_LOCKED로 거부됨",
       !bSaveAttempt.ok && String(bSaveAttempt.error).includes("ITEM_LOCKED:REQ-LOCK-TEST"),
       JSON.stringify(bSaveAttempt));
 
     const release = await invokeRaw(pageA, "release_item_lock", { projectPath: SHARED_PATH_FOR_APP, itemId: "REQ-LOCK-TEST", userId: "userA" });
-    const bRetry = await invokeRaw(pageB, "save_data", {
-      path: SHARED_PATH_FOR_APP, data: conflictingPayload, expectedRev: baseRev, userId: "userB",
-    });
+    let bRetry = null;
+    for (let i = 0; i < 5; i++) {
+      const fresh = await invokeRaw(pageA, "read_data", { path: SHARED_PATH_FOR_APP });
+      const freshRev = fresh.ok ? (fresh.res.rev ?? 0) : 0;
+      bRetry = await invokeRaw(pageB, "save_data", {
+        path: SHARED_PATH_FOR_APP, data: conflictingPayload, expectedRev: freshRev, userId: "userB",
+      });
+      if (bRetry.ok || !String(bRetry.error).includes("VERSION_CONFLICT")) break;
+      await sleep(1000);
+    }
     rec("락 해제 후 B의 동일 저장은 성공함(락 해제 시 정상 동작 확인)", release.ok && bRetry.ok, JSON.stringify(bRetry));
   }
 } catch (e) {
