@@ -376,6 +376,22 @@ export default function App() {
   const dataPayloadRef = useRef("");
   const syncTimerRef = useRef<any>(null);
 
+  // §9 T2/R5 수정: 저장 경합 대응.
+  // - conflictStreakRef: 연속 VERSION_CONFLICT 횟수 — 지수 백오프 계산용(다중 사용자
+  //   동시 충돌 시 전원이 동시에 재시도하는 thundering herd 방지, 지터 포함).
+  // - saveRetryNonce/saveRetryTimerRef: ITEM_LOCKED/LOCK_TIMEOUT으로 저장이 보류됐을 때
+  //   상태 변경이 더 없어도 자동으로 재시도하도록 저장 이펙트를 재점화하는 논스.
+  const conflictStreakRef = useRef(0);
+  const saveRetryTimerRef = useRef<any>(null);
+  const [saveRetryNonce, setSaveRetryNonce] = useState(0);
+  const scheduleSaveRetry = (delayMs: number) => {
+    if (saveRetryTimerRef.current) return; // 단일 타이머만 유지
+    saveRetryTimerRef.current = setTimeout(() => {
+      saveRetryTimerRef.current = null;
+      setSaveRetryNonce((n) => n + 1);
+    }, delayMs);
+  };
+
   // Future feature modal states
   const [comingSoonFeature, setComingSoonFeature] = useState<string | null>(
     null,
@@ -803,6 +819,7 @@ export default function App() {
               userId: currentUser.id,
             });
             if (newModified) lastSaveRef.current = newModified;
+            conflictStreakRef.current = 0; // 저장 성공 → 백오프 리셋
 
             await invoke("append_changelog", {
               projectPath: dbPath,
@@ -816,12 +833,29 @@ export default function App() {
           } catch (e: any) {
             console.error("Tauri save failed", e);
             if (String(e).includes("VERSION_CONFLICT")) {
-              await executeSmartMerge(dbPath);
+              // §9 T2 수정: 즉시 재시도하지 않고 지수 백오프+지터 후 병합 —
+              // 여러 사용자가 동시에 충돌했을 때 재시도가 서로 겹치지 않게 분산시킨다.
+              const streak = conflictStreakRef.current++;
+              const backoff =
+                Math.min(250 * 2 ** streak, 3000) + Math.random() * 250;
+              setTimeout(() => {
+                executeSmartMerge(dbPath).catch((err) =>
+                  console.error("Backoff merge failed:", err),
+                );
+              }, backoff);
               return; // Early return to prevent overwriting lastSavedPayload with conflicting data
             } else if (String(e).includes("ITEM_LOCKED")) {
               // 결함#4 수정: 타 사용자가 편집 중인 항목이 있어 저장이 거부됨.
-              // lastSavedPayload를 갱신하지 않아 다음 상태 변경 시 자동 재시도된다.
-              setSyncError("다른 사용자가 편집 중인 항목이 있어 저장이 보류되었습니다. 편집이 끝나면 자동으로 다시 저장됩니다.");
+              // §9 R5 수정: 상태 변경이 더 없어도 3초 후 자동 재시도(락 TTL 최대 15초이므로
+              // 곧 해소됨). lastSavedPayload를 갱신하지 않아 재시도 시 같은 내용이 저장된다.
+              setSyncError("다른 사용자가 편집 중인 항목이 있어 저장이 보류되었습니다. 잠시 후 자동으로 다시 저장됩니다.");
+              scheduleSaveRetry(3000);
+              return;
+            } else if (String(e).includes("LOCK_TIMEOUT")) {
+              // §9 T1 수정: 공유 파일 임계구역 혼잡은 "오프라인"이 아니라 일시적 대기 상태 —
+              // 사용자에게 정확히 알리고 지터를 섞어 자동 재시도한다.
+              setSyncError("공유 파일 사용량이 많아 저장 대기 중입니다. 자동으로 다시 시도합니다.");
+              scheduleSaveRetry(1500 + Math.random() * 1500);
               return;
             } else {
               throw e;
@@ -838,7 +872,7 @@ export default function App() {
         lastSavedPayload.current = newPayload;
       }
     }, 1000); // Atomic write with debounce
-  }, [tabDataMap, tabs, assigneesPool, appName, dbPath]); // Triggers when state changes
+  }, [tabDataMap, tabs, assigneesPool, appName, dbPath, saveRetryNonce]); // Triggers when state changes or a deferred save retries
 
   // 4. Force flush on unload/visibilitychange
   useEffect(() => {

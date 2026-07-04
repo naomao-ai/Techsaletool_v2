@@ -200,25 +200,28 @@ try {
     log("  [진단] A DOM:", JSON.stringify(diag));
   } else {
     // 5) 아이템 락(locks/) — NAS 경로 위에서 획득/조회 확인
-    log("[5] 아이템 락(locks/) NAS 경로 검증...");
+    // 결함#8 수정 검증: 실 UI와 동일한 "탭ID:행ID"(콜론) 형식 사용. 콜론은 파일명에서
+    // %3A로 인코딩되어 저장되고, 스캔 시 원래 키로 디코딩되어야 한다.
+    log("[5] 아이템 락(locks/) NAS 경로 검증(실 UI 콜론 형식)...");
+    const L4_LOCK_ID = "requirements:L4-TEST-1";
     const lockAcq = await invokeRaw(pageA, "acquire_item_lock", {
-      projectPath: SHARED_PATH_FOR_APP, itemId: "L4-TEST-1", userId: "userA", userName: "사용자A",
+      projectPath: SHARED_PATH_FOR_APP, itemId: L4_LOCK_ID, userId: "userA", userName: "사용자A",
     });
-    rec("A가 NAS 경로에 아이템 락 획득", lockAcq.ok && lockAcq.res === true, JSON.stringify(lockAcq));
+    rec("A가 NAS 경로에 콜론 형식 아이템 락 획득", lockAcq.ok && lockAcq.res === true, JSON.stringify(lockAcq));
 
     const activeLocks = await invokeRaw(pageB, "get_active_locks", { projectPath: SHARED_PATH_FOR_APP });
-    const seenByB = activeLocks.ok && activeLocks.res && activeLocks.res["L4-TEST-1"];
-    rec("B가 NAS 경로에서 A의 락을 조회(파일 기반 락 가시성)", !!seenByB, JSON.stringify(activeLocks));
+    const seenByB = activeLocks.ok && activeLocks.res && activeLocks.res[L4_LOCK_ID];
+    rec("[결함#8 수정 확인] B가 NAS 경로에서 콜론 락을 원래 키로 조회(가시성 복원)", !!seenByB, JSON.stringify(activeLocks));
 
-    const lockFileExists = fs.existsSync(path.join(LOCKS, "item_L4-TEST-1.lock"));
-    rec("locks/item_L4-TEST-1.lock 파일이 NAS 경로에 실제 생성됨", lockFileExists);
+    const lockFileExists = fs.existsSync(path.join(LOCKS, "item_requirements%3AL4-TEST-1.lock"));
+    rec("[결함#8 수정 확인] 인코딩된 락 파일(item_requirements%3AL4-TEST-1.lock)이 실제 생성됨", lockFileExists);
 
     const lockConflict = await invokeRaw(pageB, "acquire_item_lock", {
-      projectPath: SHARED_PATH_FOR_APP, itemId: "L4-TEST-1", userId: "userB", userName: "사용자B",
+      projectPath: SHARED_PATH_FOR_APP, itemId: L4_LOCK_ID, userId: "userB", userName: "사용자B",
     });
     rec("B가 A 보유 락에 대해 획득 거부됨(충돌 정상)", !lockConflict.ok, JSON.stringify(lockConflict));
 
-    await invokeRaw(pageA, "release_item_lock", { projectPath: SHARED_PATH_FOR_APP, itemId: "L4-TEST-1", userId: "userA" });
+    await invokeRaw(pageA, "release_item_lock", { projectPath: SHARED_PATH_FOR_APP, itemId: L4_LOCK_ID, userId: "userA" });
 
     // 6) 협업 전파: A가 제목 편집 → 공유파일(NAS) 반영 → B 전파
     const marker = `L4COLLAB_${Date.now()}`;
@@ -257,9 +260,9 @@ try {
     // 그래서 저장 시도 직전에 매번 rev를 새로 읽고, 우연한 VERSION_CONFLICT는 재시도한다.
     log("[8] 결함#4 검증: NAS 경로에서 아이템 락 vs save_data...");
     const lockAcq2 = await invokeRaw(pageA, "acquire_item_lock", {
-      projectPath: SHARED_PATH_FOR_APP, itemId: "REQ-LOCK-TEST-L4", userId: "userA", userName: "사용자A",
+      projectPath: SHARED_PATH_FOR_APP, itemId: "t_locktest:REQ-LOCK-TEST-L4", userId: "userA", userName: "사용자A",
     });
-    rec("A가 NAS 경로에서 REQ-LOCK-TEST-L4 락 획득", lockAcq2.ok && lockAcq2.res === true);
+    rec("A가 NAS 경로에서 실 UI 형식 락 획득", lockAcq2.ok && lockAcq2.res === true);
 
     const conflictingPayload = JSON.stringify({ tabDataMap: { t_locktest: { requirements: [{ id: "REQ-LOCK-TEST-L4", title: "B가 덮어쓰기 시도" }] } } });
     let bSaveAttempt = null;
@@ -273,11 +276,11 @@ try {
       if (!bSaveAttempt.ok && String(bSaveAttempt.error).includes("VERSION_CONFLICT")) { await sleep(1000); continue; } // 배경 저장으로 rev가 움직인 것 — 재시도
       break;
     }
-    rec("[결함#4 수정 확인] NAS 경로에서도 락 보유 항목 저장 시도가 ITEM_LOCKED로 거부됨",
-      !bSaveAttempt.ok && String(bSaveAttempt.error).includes("ITEM_LOCKED:REQ-LOCK-TEST-L4"),
+    rec("[결함#4+#8 수정 확인] NAS 경로에서도 락 보유 항목 저장 시도가 ITEM_LOCKED로 거부됨",
+      !bSaveAttempt.ok && String(bSaveAttempt.error).includes("ITEM_LOCKED:t_locktest:REQ-LOCK-TEST-L4"),
       JSON.stringify(bSaveAttempt));
 
-    await invokeRaw(pageA, "release_item_lock", { projectPath: SHARED_PATH_FOR_APP, itemId: "REQ-LOCK-TEST-L4", userId: "userA" });
+    await invokeRaw(pageA, "release_item_lock", { projectPath: SHARED_PATH_FOR_APP, itemId: "t_locktest:REQ-LOCK-TEST-L4", userId: "userA" });
     let bRetry = null;
     for (let i = 0; i < 5; i++) {
       const fresh = await invokeRaw(pageA, "read_data", { path: SHARED_PATH_FOR_APP });

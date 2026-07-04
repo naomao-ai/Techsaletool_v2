@@ -230,10 +230,17 @@ try {
     // 무관한 VERSION_CONFLICT로 오탐할 수 있다 — 시도 직전마다 rev를 새로 읽고, 우연한
     // VERSION_CONFLICT는 재시도해 실제 락 차단(ITEM_LOCKED) 여부만 정확히 검증한다.
     log("[6] 결함#4 검증: 아이템 락 vs save_data(direct invoke)...");
+    // 결함#8 수정 검증: 실 UI(Spreadsheet.tsx)와 동일한 "탭ID:행ID"(콜론 포함) 형식으로 락을 건다.
+    // 수정 전에는 콜론이 NTFS ADS로 변질되어 락이 디렉터리 스캔에 안 보였고 저장 차단도 미작동했다.
+    const LOCK_ITEM_ID = "t_locktest:REQ-LOCK-TEST";
     const lockAcq = await invokeRaw(pageA, "acquire_item_lock", {
-      projectPath: SHARED_PATH_FOR_APP, itemId: "REQ-LOCK-TEST", userId: "userA", userName: "사용자A",
+      projectPath: SHARED_PATH_FOR_APP, itemId: LOCK_ITEM_ID, userId: "userA", userName: "사용자A",
     });
-    rec("A가 REQ-LOCK-TEST 락 획득", lockAcq.ok && lockAcq.res === true);
+    rec("A가 실 UI 형식(탭ID:행ID) 락 획득", lockAcq.ok && lockAcq.res === true);
+
+    const visLocks = await invokeRaw(pageB, "get_active_locks", { projectPath: SHARED_PATH_FOR_APP });
+    rec("[결함#8 수정 확인] B가 콜론 형식 락을 원래 키로 조회 가능(가시성 복원)",
+      visLocks.ok && !!visLocks.res[LOCK_ITEM_ID], JSON.stringify(visLocks.res));
 
     const conflictingPayload = JSON.stringify({ tabDataMap: { t_locktest: { requirements: [{ id: "REQ-LOCK-TEST", title: "B가 덮어쓰기 시도" }] } } });
     let bSaveAttempt = null;
@@ -247,11 +254,11 @@ try {
       if (!bSaveAttempt.ok && String(bSaveAttempt.error).includes("VERSION_CONFLICT")) { await sleep(1000); continue; }
       break;
     }
-    rec("[결함#4 수정 확인] B가 락 보유 항목을 건드리는 저장 시도 → ITEM_LOCKED로 거부됨",
-      !bSaveAttempt.ok && String(bSaveAttempt.error).includes("ITEM_LOCKED:REQ-LOCK-TEST"),
+    rec("[결함#4+#8 수정 확인] B가 락 보유 항목을 건드리는 저장 시도 → ITEM_LOCKED로 거부됨",
+      !bSaveAttempt.ok && String(bSaveAttempt.error).includes(`ITEM_LOCKED:${LOCK_ITEM_ID}`),
       JSON.stringify(bSaveAttempt));
 
-    const release = await invokeRaw(pageA, "release_item_lock", { projectPath: SHARED_PATH_FOR_APP, itemId: "REQ-LOCK-TEST", userId: "userA" });
+    const release = await invokeRaw(pageA, "release_item_lock", { projectPath: SHARED_PATH_FOR_APP, itemId: LOCK_ITEM_ID, userId: "userA" });
     let bRetry = null;
     for (let i = 0; i < 5; i++) {
       const fresh = await invokeRaw(pageA, "read_data", { path: SHARED_PATH_FOR_APP });

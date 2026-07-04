@@ -104,20 +104,50 @@ fn read_current(path: &str) -> (serde_json::Value, u64) {
     }
 }
 
-/// `read_data` 커맨드의 코어. `.bak` 자동 복구 포함(원본 main.rs 동작 유지) + `_rev` 반환.
+/// `read_data` 커맨드의 코어. `.bak` 자동 복구 포함 + `_rev` 반환.
+///
+/// 결함 분석 §9 R1 수정(2026-07-04): 기존에는 **모든** 읽기 실패에 `.bak` 복구를 발동해
+/// 오래된 백업을 현재 파일 위에 덮어썼다. 다중 사용자 환경에서는 다른 클라이언트의
+/// rename/copy 순간에 발생하는 일시적 공유 위반(SMB sharing violation)도 "읽기 실패"이므로,
+/// 최신 데이터가 낮은 rev의 백업으로 롤백되는 사고가 가능했다.
+/// 수정 후 정책:
+///   - 일시 IO 오류(권한/공유 위반 등) → 100ms 간격 3회 재시도 → 그래도 실패면 **복구 없이 에러 반환**
+///     (파일 자체는 멀쩡할 가능성이 높으므로 절대 덮어쓰지 않음. 호출부는 기존 상태 유지)
+///   - 파일 없음(NotFound) → `.bak` 복구 (크래시로 rename이 미완된 경우의 정당한 복구)
+///   - 읽기는 성공했으나 JSON 파싱 실패(파일 손상) → `.bak` 복구 (정당한 손상 복구)
 pub fn read_data_inner(path: &str) -> Result<(serde_json::Value, u64), String> {
-    let content = fs::read_to_string(path);
+    let mut last_io_err: Option<std::io::Error> = None;
 
-    let json_val = match content {
-        Ok(c) => match serde_json::from_str::<serde_json::Value>(&c) {
-            Ok(j) => j,
-            Err(_) => recover_from_backup(path)?,
-        },
-        Err(_) => recover_from_backup(path)?,
-    };
+    for attempt in 0..3 {
+        match fs::read_to_string(path) {
+            Ok(c) => {
+                let json_val = match serde_json::from_str::<serde_json::Value>(&c) {
+                    Ok(j) => j,
+                    Err(_) => recover_from_backup(path)?, // 손상 → 정당한 복구
+                };
+                let rev = json_val.get("_rev").and_then(|r| r.as_u64()).unwrap_or(0);
+                return Ok((json_val, rev));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // 파일 자체가 없음 → 재시도 무의미, 크래시 복구 경로
+                let json_val = recover_from_backup(path)?;
+                let rev = json_val.get("_rev").and_then(|r| r.as_u64()).unwrap_or(0);
+                return Ok((json_val, rev));
+            }
+            Err(e) => {
+                last_io_err = Some(e);
+                if attempt < 2 {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+        }
+    }
 
-    let rev = json_val.get("_rev").and_then(|r| r.as_u64()).unwrap_or(0);
-    Ok((json_val, rev))
+    // 일시 IO 오류 소진 — .bak를 건드리지 않고 에러 반환(호출부가 현 상태 유지)
+    Err(format!(
+        "READ_RETRY_EXHAUSTED: {}",
+        last_io_err.map(|e| e.to_string()).unwrap_or_default()
+    ))
 }
 
 fn recover_from_backup(path: &str) -> Result<serde_json::Value, String> {
@@ -170,18 +200,76 @@ fn atomic_write(path: &str, data: &str) -> Result<(), String> {
 }
 
 // ══════════════════════════════════════════════════════════════════════
-//  아이템 락 ↔ 저장 경로 연동 (결함#4 해결)
+//  락 ID ↔ 파일명 인코딩 (결함#8 해결)
+// ══════════════════════════════════════════════════════════════════════
+// UI는 락 itemId로 `탭ID:행ID`(예: "requirements:REQ-001")를 사용하는데, 콜론은
+// Windows 파일명 금지 문자다(NTFS에서는 ADS로 변질되어 디렉터리 스캔에 안 보이고,
+// Samba NAS에서는 쓰기 자체가 거부될 수 있음 — §9.1 실증). 락 파일명에 쓰기 전
+// 금지 문자('%' 포함, 전단사 보장)를 %XX(hex)로 인코딩하고, 스캔 시 디코딩해
+// 원래 itemId를 복원한다. 모든 락 함수(acquire/release/get_active_locks)가
+// 이 인코딩을 일괄 사용하므로 우회 경로가 없다.
+
+fn encode_lock_id(id: &str) -> String {
+    let mut out = String::with_capacity(id.len());
+    for c in id.chars() {
+        let code = c as u32;
+        let forbidden = matches!(c, '%' | ':' | '/' | '\\' | '*' | '?' | '"' | '<' | '>' | '|')
+            || code < 0x20;
+        if forbidden {
+            out.push('%');
+            out.push_str(&format!("{:02X}", code));
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn decode_lock_id(encoded: &str) -> String {
+    let mut out = String::with_capacity(encoded.len());
+    let mut chars = encoded.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            let h1 = chars.next();
+            let h2 = chars.next();
+            if let (Some(h1), Some(h2)) = (h1, h2) {
+                if let Ok(code) = u32::from_str_radix(&format!("{}{}", h1, h2), 16) {
+                    if let Some(decoded) = char::from_u32(code) {
+                        out.push(decoded);
+                        continue;
+                    }
+                }
+                // 유효하지 않은 시퀀스는 원문 보존
+                out.push('%');
+                out.push(h1);
+                out.push(h2);
+            } else {
+                out.push('%');
+                if let Some(h1) = h1 {
+                    out.push(h1);
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+// ══════════════════════════════════════════════════════════════════════
+//  아이템 락 ↔ 저장 경로 연동 (결함#4 해결, 결함#8로 키 네임스페이스 정합)
 // ══════════════════════════════════════════════════════════════════════
 
-/// payload의 `tabDataMap.*.requirements[]`에서 `id -> 정규화된 내용 문자열` 맵 추출.
+/// payload의 `tabDataMap.*.requirements[]`에서 `"탭ID:행ID" -> 정규화된 내용 문자열` 맵 추출.
+/// 결함#8 수정: UI 락 키(`탭ID:행ID`)와 일치하도록 탭 네임스페이스를 포함한다.
 fn extract_requirement_map(value: &serde_json::Value) -> HashMap<String, String> {
     let mut map = HashMap::new();
     if let Some(tab_data_map) = value.get("tabDataMap").and_then(|v| v.as_object()) {
-        for tab_data in tab_data_map.values() {
+        for (tab_id, tab_data) in tab_data_map.iter() {
             if let Some(reqs) = tab_data.get("requirements").and_then(|v| v.as_array()) {
                 for req in reqs {
                     if let Some(id) = req.get("id").and_then(|v| v.as_str()) {
-                        map.insert(id.to_string(), req.to_string());
+                        map.insert(format!("{}:{}", tab_id, id), req.to_string());
                     }
                 }
             }
@@ -219,7 +307,13 @@ fn find_locked_conflict(
 
     let active_locks = get_active_locks_from_dir(locks_dir);
     for id in &touched {
-        if let Some(lock) = active_locks.get(id) {
+        // 결함#8 수정: 1차로 UI 형식("탭ID:행ID") 정확 매치, 2차로 평면 행ID 매치
+        // (탭 정보 없이 획득된 레거시/외부 락과의 호환 — 방어적).
+        let plain_row_id = id.split(':').nth(1).unwrap_or(id);
+        let lock = active_locks
+            .get(id)
+            .or_else(|| active_locks.get(plain_row_id));
+        if let Some(lock) = lock {
             let owner = lock.get("userId").and_then(|v| v.as_str()).unwrap_or("");
             if !owner.is_empty() && owner != user_id {
                 return Some(id.clone());
@@ -229,12 +323,24 @@ fn find_locked_conflict(
     None
 }
 
+/// 락 파일의 나이(초). §9 R2 수정: 획득자 로컬 시계로 기록된 `acquiredAt` 대신
+/// **락 파일 자체의 mtime(NAS/파일서버 시계)** 을 기준으로 나이를 계산한다.
+/// 기존에는 획득자 시계 vs 판정자 시계의 쌍별 스큐(N명이면 N² 조합)에 노출됐지만,
+/// 이제 모든 클라이언트가 동일한 파일서버 시계 하나만 상대하므로 판정이 일관된다.
+/// 하트비트(5초)가 락 파일을 재작성해 mtime을 갱신하므로 TTL(15초) 대비 10초의
+/// 스큐 여유가 있다. mtime이 미래(클라이언트가 서버보다 느림)면 나이 0으로 간주
+/// — 락이 조기 만료되지 않는 안전한 방향.
+fn lock_age_secs(lock_file: &Path) -> u64 {
+    fs::metadata(lock_file)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|mtime| mtime.elapsed().ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 fn get_active_locks_from_dir(locks_dir: &Path) -> serde_json::Map<String, serde_json::Value> {
     let mut active_locks = serde_json::Map::new();
-    let now = std::time::SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
 
     if locks_dir.exists() {
         if let Ok(entries) = fs::read_dir(locks_dir) {
@@ -244,17 +350,17 @@ fn get_active_locks_from_dir(locks_dir: &Path) -> serde_json::Map<String, serde_
                     if name.starts_with("item_") && name.ends_with(".lock") {
                         if let Ok(content) = fs::read_to_string(&file_path) {
                             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
-                                let acquired_at = json["acquiredAt"].as_u64().unwrap_or(0);
                                 let mut ttl = json["ttlSeconds"].as_u64().unwrap_or(600);
                                 if ttl > LOCK_TTL_SECONDS {
                                     ttl = LOCK_TTL_SECONDS;
                                 }
-                                if now < acquired_at + ttl {
+                                if lock_age_secs(&file_path) < ttl {
                                     if let Some(id) = name
                                         .strip_prefix("item_")
                                         .and_then(|s| s.strip_suffix(".lock"))
                                     {
-                                        active_locks.insert(id.to_string(), json);
+                                        // 결함#8 수정: 파일명 인코딩을 디코딩해 원래 itemId로 복원
+                                        active_locks.insert(decode_lock_id(id), json);
                                     }
                                 }
                             }
@@ -313,6 +419,7 @@ pub fn save_data_inner(
 }
 
 /// `acquire_item_lock` 커맨드의 코어. 파일 기반 낙관적 락.
+/// 결함#8 수정: itemId를 파일명에 쓰기 전 인코딩. §9 R2 수정: TTL 판정을 파일 mtime 기준으로.
 pub fn acquire_item_lock_inner(
     project_path: &str,
     item_id: &str,
@@ -327,7 +434,7 @@ pub fn acquire_item_lock_inner(
         fs::create_dir_all(&locks_dir).map_err(|e| e.to_string())?;
     }
 
-    let lock_file = locks_dir.join(format!("item_{}.lock", item_id));
+    let lock_file = locks_dir.join(format!("item_{}.lock", encode_lock_id(item_id)));
     let now = std::time::SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -336,12 +443,11 @@ pub fn acquire_item_lock_inner(
     if lock_file.exists() {
         if let Ok(content) = fs::read_to_string(&lock_file) {
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
-                let acquired_at = json["acquiredAt"].as_u64().unwrap_or(0);
                 let mut ttl = json["ttlSeconds"].as_u64().unwrap_or(600);
-                if ttl > 15 {
-                    ttl = 15;
+                if ttl > LOCK_TTL_SECONDS {
+                    ttl = LOCK_TTL_SECONDS;
                 }
-                if now < acquired_at + ttl {
+                if lock_age_secs(&lock_file) < ttl {
                     if json["userId"].as_str().unwrap_or("") != user_id {
                         return Err(format!(
                             "Locked by {}",
@@ -356,7 +462,7 @@ pub fn acquire_item_lock_inner(
     let lock_data = serde_json::json!({
         "userId": user_id,
         "userName": user_name,
-        "acquiredAt": now,
+        "acquiredAt": now, // 표시/디버그용 — TTL 판정은 파일 mtime 기준(§9 R2)
         "ttlSeconds": LOCK_TTL_SECONDS
     });
 
@@ -364,7 +470,7 @@ pub fn acquire_item_lock_inner(
     Ok(true)
 }
 
-/// `release_item_lock` 커맨드의 코어.
+/// `release_item_lock` 커맨드의 코어. (결함#8: 파일명 인코딩 적용)
 pub fn release_item_lock_inner(
     project_path: &str,
     item_id: &str,
@@ -373,7 +479,9 @@ pub fn release_item_lock_inner(
 ) -> Result<bool, String> {
     let path = Path::new(project_path);
     let parent = path.parent().ok_or("Invalid path")?;
-    let lock_file = parent.join("locks").join(format!("item_{}.lock", item_id));
+    let lock_file = parent
+        .join("locks")
+        .join(format!("item_{}.lock", encode_lock_id(item_id)));
 
     if lock_file.exists() {
         if force.unwrap_or(false) {
@@ -392,16 +500,13 @@ pub fn release_item_lock_inner(
 }
 
 /// `get_active_locks` 커맨드의 코어.
+/// (결함#8: 파일명 디코딩으로 원래 itemId 복원 / §9 R2: mtime 기반 TTL / 만료 락 정리 유지)
 pub fn get_active_locks_inner(project_path: &str) -> Result<serde_json::Value, String> {
     let path = Path::new(project_path);
     let parent = path.parent().ok_or("Invalid path")?;
     let locks_dir = parent.join("locks");
 
     let mut active_locks = serde_json::Map::new();
-    let now = std::time::SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
 
     if locks_dir.exists() {
         if let Ok(entries) = fs::read_dir(&locks_dir) {
@@ -413,18 +518,17 @@ pub fn get_active_locks_inner(project_path: &str) -> Result<serde_json::Value, S
                             if let Ok(json) =
                                 serde_json::from_str::<serde_json::Value>(&content)
                             {
-                                let acquired_at = json["acquiredAt"].as_u64().unwrap_or(0);
                                 let mut ttl = json["ttlSeconds"].as_u64().unwrap_or(600);
-                                if ttl > 15 {
-                                    ttl = 15;
+                                if ttl > LOCK_TTL_SECONDS {
+                                    ttl = LOCK_TTL_SECONDS;
                                 }
-                                if now >= acquired_at + ttl {
+                                if lock_age_secs(&file_path) >= ttl {
                                     let _ = fs::remove_file(&file_path);
                                 } else if let Some(id) = name
                                     .strip_prefix("item_")
                                     .and_then(|s| s.strip_suffix(".lock"))
                                 {
-                                    active_locks.insert(id.to_string(), json);
+                                    active_locks.insert(decode_lock_id(id), json);
                                 }
                             }
                         }
@@ -605,10 +709,11 @@ mod tests {
         assert!(active.get("REQ-001").is_some(), "REQ-001 락이 활성 상태여야 함");
 
         // B가 락을 무시하고 REQ-001을 변경하는 전체 파일 저장 시도
+        // (평면 행ID 락이므로 find_locked_conflict의 2차 폴백 매치로 차단 — 결함#8 수정 후에도 유지)
         let changed = r#"{"tabDataMap":{"t1":{"requirements":[{"id":"REQ-001","overwritten_by":"B"}]}}}"#;
         let b = save_data_inner(p, changed, v0, "userB");
         assert!(
-            b.is_err() && b.as_ref().unwrap_err().starts_with("ITEM_LOCKED:REQ-001"),
+            b.is_err() && b.as_ref().unwrap_err().starts_with("ITEM_LOCKED:t1:REQ-001"),
             "[수정 확인] 락 보유 중인 REQ-001을 건드리는 저장은 ITEM_LOCKED로 거부되어야 함. 실제={:?}",
             b
         );
@@ -634,5 +739,158 @@ mod tests {
         let touch_other = r#"{"tabDataMap":{"t1":{"requirements":[{"id":"REQ-001","x":1},{"id":"REQ-002","x":2}]}}}"#;
         let c = save_data_inner(p2, touch_other, v0_2, "userC");
         assert!(c.is_ok(), "락과 무관한 REQ-002만 바뀐 저장은 통과해야 함. 실제={:?}", c);
+    }
+
+    // ── [결함#8 수정 확인] 콜론 포함 실 UI 형식("탭ID:행ID") 락이 정상 동작 ──
+    // 수정 전: 콜론이 NTFS ADS로 변질되어 디렉터리 스캔에 안 보이고(락 가시성 0),
+    // 저장 검증 키와도 불일치해 결함#4 보호가 실 UI에서 미작동했다.
+    #[test]
+    fn defect8_fixed_colon_item_ids_work_end_to_end() {
+        // 인코딩/디코딩 왕복 보장
+        let ugly = r#"tab:REQ/00\1*?"<>|%"#;
+        assert_eq!(decode_lock_id(&encode_lock_id(ugly)), ugly, "인코딩 왕복 무손실");
+        assert!(
+            !encode_lock_id(ugly).contains(|c: char| matches!(c, ':' | '/' | '\\' | '*' | '?' | '"' | '<' | '>' | '|')),
+            "인코딩 결과에 금지 문자가 없어야 함: {}",
+            encode_lock_id(ugly)
+        );
+
+        let dir = unique_dir("defect8");
+        let path = dir.join("data.json");
+        let p = path.to_str().unwrap();
+        fs::write(&path, r#"{"tabDataMap":{"requirements":{"requirements":[{"id":"REQ-001","v":1}]}}}"#).unwrap();
+        let v0 = rev_of(&path);
+
+        // 실 UI 형식으로 락 획득 (Spreadsheet.tsx와 동일)
+        let ui_item_id = "requirements:REQ-001";
+        acquire_item_lock_inner(p, ui_item_id, "userA", "Alice").unwrap();
+
+        // ① 락 파일이 디렉터리 스캔에 실제로 잡히는 진짜 파일이어야 함(ADS 아님)
+        let lock_files: Vec<String> = fs::read_dir(dir.join("locks"))
+            .unwrap()
+            .flatten()
+            .filter_map(|e| e.file_name().to_str().map(String::from))
+            .filter(|n| n.starts_with("item_") && n.ends_with(".lock"))
+            .collect();
+        assert_eq!(lock_files.len(), 1, "락 파일 1개가 디렉터리에 보여야 함. 실제={lock_files:?}");
+        assert!(
+            lock_files[0].contains("%3A"),
+            "콜론이 %3A로 인코딩된 파일명이어야 함. 실제={}",
+            lock_files[0]
+        );
+
+        // ② get_active_locks가 원래 itemId(콜론 포함)로 복원해 반환 — UI 인디케이터 키와 일치
+        let active = get_active_locks_inner(p).unwrap();
+        assert!(
+            active.get(ui_item_id).is_some(),
+            "[수정 확인] 콜론 형식 락이 활성 목록에 원래 키로 보여야 함. 실제={active}"
+        );
+
+        // ③ 저장 검증: 타 사용자가 락 걸린 항목을 변경하는 저장은 ITEM_LOCKED
+        let changed = r#"{"tabDataMap":{"requirements":{"requirements":[{"id":"REQ-001","v":2}]}}}"#;
+        let b = save_data_inner(p, changed, v0, "userB");
+        assert!(
+            b.is_err() && b.as_ref().unwrap_err().starts_with("ITEM_LOCKED:requirements:REQ-001"),
+            "[수정 확인] 실 UI 형식 락도 저장을 차단해야 함(결함#4가 실 경로에서 작동). 실제={:?}",
+            b
+        );
+
+        // ④ 해제 후 정상 저장
+        release_item_lock_inner(p, ui_item_id, "userA", None).unwrap();
+        let active_after = get_active_locks_inner(p).unwrap();
+        assert!(active_after.get(ui_item_id).is_none(), "해제 후 락이 사라져야 함");
+        let b_retry = save_data_inner(p, changed, v0, "userB");
+        assert!(b_retry.is_ok(), "해제 후 저장은 통과. 실제={:?}", b_retry);
+    }
+
+    // ── [§9 R1 수정 확인] 손상 파일은 .bak로 복구되지만, 일시 IO 오류는 롤백을 유발하지 않음 ──
+    #[test]
+    fn r1_fixed_corrupt_file_recovers_from_bak() {
+        let dir = unique_dir("r1_corrupt");
+        let path = dir.join("data.json");
+        let p = path.to_str().unwrap();
+        fs::write(&path, "{{{{ 손상된 JSON").unwrap();
+        fs::write(dir.join("data.json.bak"), r#"{"tabDataMap":{},"_rev":3}"#).unwrap();
+
+        let (val, rev) = read_data_inner(p).expect("손상 파일은 .bak로 복구되어야 함");
+        assert_eq!(rev, 3, "복구된 rev=3");
+        assert!(val.get("tabDataMap").is_some());
+        // 본 파일도 .bak 내용으로 복원됨
+        let restored = fs::read_to_string(&path).unwrap();
+        assert!(restored.contains(r#""_rev":3"#));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn r1_fixed_transient_lock_does_not_rollback_to_bak() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let dir = unique_dir("r1_locked");
+        let path = dir.join("data.json");
+        let p = path.to_str().unwrap();
+        // 본 파일은 최신(rev 5), .bak는 구버전(rev 1)
+        fs::write(&path, r#"{"tabDataMap":{},"_rev":5}"#).unwrap();
+        fs::write(dir.join("data.json.bak"), r#"{"tabDataMap":{},"_rev":1}"#).unwrap();
+
+        // 다른 프로세스의 배타 접근을 흉내: share_mode(0)으로 열어 공유 위반 유발
+        let _exclusive = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+
+        let result = read_data_inner(p);
+        assert!(
+            result.is_err() && result.as_ref().unwrap_err().contains("READ_RETRY_EXHAUSTED"),
+            "[수정 확인] 일시 IO 오류는 복구가 아니라 재시도 소진 에러여야 함. 실제={:?}",
+            result
+        );
+
+        drop(_exclusive);
+        // 본 파일이 구버전 .bak로 덮어써지지 않고 rev 5 그대로 남아야 함
+        let after = fs::read_to_string(&path).unwrap();
+        assert!(
+            after.contains(r#""_rev":5"#),
+            "[수정 확인] 최신 데이터가 .bak(rev1)로 롤백되지 않아야 함. 실제={after}"
+        );
+    }
+
+    // ── [§9 R2 수정 확인] TTL 판정이 acquiredAt(획득자 시계)이 아니라 파일 mtime 기준 ──
+    #[test]
+    fn r2_fixed_ttl_uses_file_mtime_not_writer_clock() {
+        let dir = unique_dir("r2_mtime");
+        let path = dir.join("data.json");
+        let p = path.to_str().unwrap();
+        fs::write(&path, "{}").unwrap();
+
+        // 획득자 시계가 크게 어긋난 상황을 흉내: acquiredAt을 1시간 과거로 조작한 락 파일을 직접 기록
+        let locks_dir = dir.join("locks");
+        fs::create_dir_all(&locks_dir).unwrap();
+        let skewed_acquired_at = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - 3600;
+        let lock_content = serde_json::json!({
+            "userId": "userA", "userName": "Alice",
+            "acquiredAt": skewed_acquired_at, // 구식 판정이라면 즉시 만료로 오판할 값
+            "ttlSeconds": LOCK_TTL_SECONDS
+        });
+        fs::write(locks_dir.join("item_REQ-SKEW.lock"), lock_content.to_string()).unwrap();
+
+        // 파일은 방금 만들어졌으므로(mtime=now) mtime 기준으로는 활성이어야 함
+        let active = get_active_locks_inner(p).unwrap();
+        assert!(
+            active.get("REQ-SKEW").is_some(),
+            "[수정 확인] acquiredAt이 아무리 과거여도 파일이 방금 쓰였으면(mtime) 락은 활성. 실제={active}"
+        );
+
+        // 타 사용자 획득 시도도 mtime 기준으로 거부되어야 함
+        let b = acquire_item_lock_inner(p, "REQ-SKEW", "userB", "Bob");
+        assert!(
+            b.is_err() && b.as_ref().unwrap_err().contains("Locked by"),
+            "[수정 확인] 시계 스큐와 무관하게 신선한 락은 타 사용자를 거부. 실제={:?}",
+            b
+        );
     }
 }
