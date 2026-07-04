@@ -526,11 +526,23 @@ export default function Spreadsheet({
   } | null>(null);
   const cellRef = useRef<{ rowId: string; field: string } | null>(null);
   const locksRef = useRef<any>(null);
+  // [결함 #10] 편집창을 연 시점의 필드 기준값. 커밋 시 이 값과 현재 상태값을 비교해
+  // 편집 중 타 사용자가 같은 셀을 바꿨는지(stale) 판정한다.
+  const editBaselineRef = useRef<{ rowId: string; field: string; value: any } | null>(null);
+  const reqByIdRef = useRef<Map<string, any>>(new Map());
 
   useEffect(() => {
     cellRef.current = activeCellEditor;
     locksRef.current = activeLocks;
+    reqByIdRef.current = reqById;
   });
+
+  // 편집 텍스트 필드의 현재 값 조회(표준 필드 + 커스텀 컬럼).
+  const getFieldValue = (req: any, field: string) => {
+    if (!req) return undefined;
+    if (["id", "title", "priority", "status", "dueDate"].includes(field)) return req[field];
+    return req.customColumns?.[field];
+  };
 
   // Real-time Editing Lock Helpers
   const setActiveCellEditor = useCallback(
@@ -539,6 +551,7 @@ export default function Spreadsheet({
 
       // If closing, release the currently held lock
       if (val === null && activeCell) {
+        editBaselineRef.current = null; // [결함 #10] 편집 종료 → 기준값 해제
         // @ts-ignore
         if (
           (("__TAURI_INTERNALS__" in window) || ("__TAURI_IPC__" in window)) &&
@@ -560,6 +573,12 @@ export default function Spreadsheet({
       }
       // If opening, request lock from server
       if (val) {
+        // [결함 #10] 편집 시작 시점의 필드 값을 기준으로 저장(커밋 시 stale 판정).
+        editBaselineRef.current = {
+          rowId: val.rowId,
+          field: val.field,
+          value: getFieldValue(reqByIdRef.current.get(val.rowId), val.field),
+        };
         // Optimistic UI state update to eliminate delay
         setActiveCellEditorState(val);
         // @ts-ignore
@@ -613,7 +632,9 @@ export default function Spreadsheet({
           userName: currentUser.name,
         });
       } catch (e) {
-        // Lock lost (e.g. another user forced it or error)
+        // [결함 #10] 하트비트 재획득 실패 = 락 상실(TTL 만료/네트워크/타인 선점).
+        // 데이터 안전은 커밋 시 stale 검사가 보장하지만, 관찰성을 위해 경고를 남긴다.
+        console.warn("LOCK_LOST: 편집 중 락 갱신 실패 — 다른 사용자가 이 항목을 편집했을 수 있습니다.");
       }
     }, 5000); // Send heartbeat every 5 seconds
 
@@ -1020,6 +1041,30 @@ export default function Spreadsheet({
   // 4. Update single field
   const updateRequirementField = useCallback(
     (rowId: string, field: string, value: any) => {
+      // [결함 #10 수정] 편집 중 stale 검사.
+      // A가 셀 편집창을 연 뒤 유휴한 사이 락이 만료되고 B가 같은 셀을 편집·저장하면,
+      // A의 편집창은 uncontrolled(defaultValue)라 화면엔 A의 옛 초안이 남지만 상태값은
+      // B의 값으로 병합돼 있다. 이때 A가 커밋하면 옛 초안이 B의 값을 조용히 덮어써
+      // B의 저장 내용이 무통지 유실됐다(재현: verify_defect10.mjs).
+      // → 커밋 시 "편집 시작 시점 기준값"과 "현재 상태값"을 비교해, 그 사이 값이
+      //   바뀌었고(=타인이 편집) 내가 그와 다른 값으로 덮어쓰려 하면, 덮어쓰기를 막고
+      //   A에게 통지한다(B의 값 보존, A는 최신값 확인 후 재편집).
+      const baseline = editBaselineRef.current;
+      if (baseline && baseline.rowId === rowId && baseline.field === field) {
+        const currentVal = getFieldValue(reqByIdRef.current.get(rowId), field);
+        const changedByOther = String(currentVal ?? "") !== String(baseline.value ?? "");
+        const iAmOverwriting = String(value ?? "") !== String(currentVal ?? "");
+        if (changedByOther && iAmOverwriting) {
+          console.warn(
+            `STALE_EDIT: '${field}' 항목이 편집 중 다른 사용자에 의해 변경됨 (기준='${baseline.value}' → 현재='${currentVal}'). 내 입력 '${value}'은 적용하지 않음(상대 값 보존).`,
+          );
+          editBaselineRef.current = null;
+          alert(
+            `편집하시던 항목이 그 사이 다른 사용자에 의해 변경되었습니다.\n\n최신 값: "${currentVal}"\n\n회원님의 입력은 적용하지 않았습니다. 최신 내용을 확인한 뒤 다시 편집해 주세요.`,
+          );
+          return; // 덮어쓰기 차단 — 상대(B)의 값 보존
+        }
+      }
       setRequirements((prev) =>
         prev.map((req) => {
           if (req.id === rowId) {
