@@ -237,22 +237,33 @@ try {
     const bT = await getInputByPlaceholder(pageB, TITLE_PH);
     rec("B가 NAS 경로 파일감시(notify)로 A 변경 전파받음", prop, `B 제목='${bT}'`);
 
-    // 7) 충돌 시나리오 — 결함#3 수정 확인: NAS(네트워크) 경로에서도 VERSION_CONFLICT가
-    // 실제로 발생해야 한다(더 이상 mtime 500ms 창에 의한 무음 레이스가 아님).
+    // 7) 충돌 시나리오 — [결함#3 검증, §14에서 안전 속성 단언으로 전환]
+    // 코얼레싱+폴링 폴백 이후 원시 VERSION_CONFLICT 없이 선제 병합으로 해소되는 것도
+    // 정상 경로이므로, "무손실 수렴"(A·B·파일 동일 값, 마커 중 하나 생존)을 단언한다.
     log("[7] 충돌: A·B 동시 편집(NAS 경로)...");
     const preConflictLogCount = consoleLog.length;
     const mA = `A_${Date.now()}`, mB = `B_${Date.now()}`;
     await Promise.all([setInputByPlaceholder(pageA, TITLE_PH, mA), setInputByPlaceholder(pageB, TITLE_PH, mB)]);
-    await sleep(8000);
-    const finalFile = (() => { try { return fs.readFileSync(SHARED_PATH_FOR_APP, "utf-8"); } catch { return ""; } })();
-    const keptA = finalFile.includes(mA), keptB = finalFile.includes(mB);
+
+    let convA = "", convB = "", convFileHasA = false, convFileHasB = false, converged = false;
+    for (let i = 0; i < 15; i++) {
+      await sleep(1000);
+      convA = (await getInputByPlaceholder(pageA, TITLE_PH)) || "";
+      convB = (await getInputByPlaceholder(pageB, TITLE_PH)) || "";
+      const f = (() => { try { return fs.readFileSync(SHARED_PATH_FOR_APP, "utf-8"); } catch { return ""; } })();
+      convFileHasA = f.includes(mA); convFileHasB = f.includes(mB);
+      const fileMatchesUi = (convFileHasA && convA === mA && convB === mA) || (convFileHasB && convA === mB && convB === mB);
+      if (fileMatchesUi && (convFileHasA !== convFileHasB)) { converged = true; break; }
+    }
     const conflictA = await pageA.evaluate(() => document.body.innerText.includes("충돌")).catch(() => false);
     const conflictB = await pageB.evaluate(() => document.body.innerText.includes("충돌")).catch(() => false);
     const sawVersionConflict = consoleLog.slice(preConflictLogCount).some((l) => l.includes("VERSION_CONFLICT"));
-    log(`  최종파일: keptA=${keptA} keptB=${keptB} / 충돌모달: A=${conflictA} B=${conflictB} / VERSION_CONFLICT 로그 관측=${sawVersionConflict}`);
-    rec("[결함#3 수정 확인] NAS 경로에서도 동시 편집 시 VERSION_CONFLICT 발생", sawVersionConflict);
-    const observed = (conflictA || conflictB) ? "충돌 모달 발생" : (keptA !== keptB ? "한쪽만 최종 반영(CAS-안전 경유, 무음 레이스 아님)" : (keptA && keptB ? "동일 반영" : "둘 다 미반영(이상)"));
-    rec("충돌 시나리오 최종 결과(정보성, NAS 경로)", true, observed);
+    log(`  수렴: A='${convA}' B='${convB}' 파일(A마커=${convFileHasA},B마커=${convFileHasB}) / 충돌모달: A=${conflictA} B=${conflictB} / VERSION_CONFLICT 관측=${sawVersionConflict}(정보성)`);
+    rec("[결함#3 수정 확인] NAS 경로에서 동시 편집이 무손실로 수렴(무음 발산 없음)",
+      converged || conflictA || conflictB,
+      converged ? `'${convA}'로 수렴` : (conflictA || conflictB ? "충돌 모달로 사용자 중재" : "15초 내 미수렴"));
+    rec("충돌 해소 경로(정보성, NAS 경로)", true,
+      sawVersionConflict ? "CAS 거부 → 병합 재시도 경유" : "선제 병합으로 CAS 충돌 없이 해소(코얼레싱+폴링 폴백 효과)");
 
     // 8) 결함#4 수정 확인: NAS 경로에서도 아이템 락 보유 항목 저장이 ITEM_LOCKED로 거부되는지
     // 결함#4 검증은 rev CAS 통과가 전제라, 배경에서 진행 중인 자동저장(디바운스)·병합

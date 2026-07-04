@@ -385,6 +385,9 @@ export default function App() {
   // - saveRetryNonce/saveRetryTimerRef: ITEM_LOCKED/LOCK_TIMEOUT으로 저장이 보류됐을 때
   //   상태 변경이 더 없어도 자동으로 재시도하도록 저장 이펙트를 재점화하는 논스.
   const conflictStreakRef = useRef(0);
+  // [§14 P3-1] 저장 디바운스 설정값화 — 기본 1000ms(기존과 동일). 10인 이상 환경에서
+  // 저장 경합이 심하면 app_config.saveDebounceMs(예: 2000)로 조정 가능(initServer에서 로드).
+  const saveDebounceRef = useRef(1000);
   const saveRetryTimerRef = useRef<any>(null);
   const [saveRetryNonce, setSaveRetryNonce] = useState(0);
   const scheduleSaveRetry = (delayMs: number) => {
@@ -402,11 +405,16 @@ export default function App() {
   const [feedbackText, setFeedbackText] = useState("");
   const [showSuccessToast, setShowSuccessToast] = useState(false);
 
-  const executeSmartMerge = async (serverPath: string) => {
+  // [§14 T3+IO 최적화] preRead: 감시자/폴링이 방금 read_data한 응답을 그대로 넘겨받아
+  // 병합 내부의 중복 read_data를 생략한다(원격 변경 1건당 NAS 읽기 2회→1회).
+  // preRead가 코얼레싱 지연만큼 오래됐어도 안전 — 저장은 _rev CAS로 보호되므로
+  // 최악의 경우 VERSION_CONFLICT 1회 후 재병합으로 수렴한다.
+  const executeSmartMerge = async (serverPath: string, preRead?: any) => {
     try {
       // @ts-ignore
       const { invoke } = await import("@tauri-apps/api/core");
-      const response: any = await invoke("read_data", { path: serverPath });
+      const response: any =
+        preRead ?? (await invoke("read_data", { path: serverPath }));
       const theirData = response.data;
       if (!theirData) return;
       const theirRev = response.rev ?? 0;
@@ -488,8 +496,48 @@ export default function App() {
     }
   };
 
+  // [§14 T3 최적화] 병합 코얼레싱 — 파일 감시자/폴링이 연속으로 변경을 알릴 때
+  // (10인 환경에선 초당 수 회) 매 이벤트마다 병합하지 않고 400ms 창으로 묶어 1회만
+  // 실행한다. 병합이 이미 진행 중이면 종료 후 1회 더 실행(pending)해 마지막 변경을
+  // 놓치지 않는다. preRead는 가장 최신 것 하나만 유지.
+  const mergeCoalesceTimerRef = useRef<any>(null);
+  const mergeInFlightRef = useRef(false);
+  const mergePendingRef = useRef<string | null>(null);
+  const mergePreReadRef = useRef<any>(null);
+  const requestSmartMerge = (serverPath: string, preRead?: any) => {
+    if (preRead) mergePreReadRef.current = preRead;
+    if (mergeInFlightRef.current) {
+      mergePendingRef.current = serverPath;
+      return;
+    }
+    if (mergeCoalesceTimerRef.current) return; // 이미 예약됨 — 이번 이벤트는 흡수
+    mergeCoalesceTimerRef.current = setTimeout(async () => {
+      mergeCoalesceTimerRef.current = null;
+      mergeInFlightRef.current = true;
+      const pre = mergePreReadRef.current;
+      mergePreReadRef.current = null;
+      try {
+        await executeSmartMerge(serverPath, pre);
+      } finally {
+        mergeInFlightRef.current = false;
+        if (mergePendingRef.current) {
+          const p = mergePendingRef.current;
+          mergePendingRef.current = null;
+          requestSmartMerge(p); // 진행 중 쌓인 변경 1회 더 반영(신선한 재판독)
+        }
+      }
+    }, 400);
+  };
+
   // 2. Fetch Server Config Loading
   // 1. Polling Locks
+  // [§14 R6 최적화] 락 폴링 + 전파 폴백 하이브리드.
+  // 일부 NAS(Samba 설정)는 디렉터리 change-notify를 지원하지 않아 파일 감시자가
+  // 조용히 침묵할 수 있다(§9 R6). 이미 2초마다 도는 락 폴링 인터벌에 mtime 힌트
+  // 검사(메타데이터만, 파일 본문 미판독)를 얹어, mtime이 움직였을 때만 read_data로
+  // rev를 확인하고 앞서 있으면 병합을 트리거한다 — 감시자가 죽어도 최대 ~2.4초
+  // 안에 전파가 보장되고, 정상 경로에선 추가 비용이 메타데이터 조회 1회뿐이다.
+  const lastPolledMtimeRef = useRef<number>(0);
   useEffect(() => {
     // @ts-ignore
     const isTauri = !!(("__TAURI_INTERNALS__" in window) || ("__TAURI_IPC__" in window));
@@ -506,6 +554,20 @@ export default function App() {
             if (JSON.stringify(prev) === JSON.stringify(newLocks)) return prev;
             return newLocks;
           });
+
+          // 전파 폴백: mtime은 변경 "힌트"로만 사용(판정은 언제나 _rev CAS)
+          try {
+            const mtime: number = await invoke("get_file_modified_time_native", {
+              path: dbPath,
+            });
+            if (mtime !== lastPolledMtimeRef.current) {
+              lastPolledMtimeRef.current = mtime;
+              const check: any = await invoke("read_data", { path: dbPath });
+              if ((check.rev ?? 0) > lastSaveRef.current) {
+                requestSmartMerge(dbPath, check);
+              }
+            }
+          } catch {}
         } catch (e) {}
       }, 2000);
       return () => clearInterval(interval);
@@ -642,6 +704,11 @@ export default function App() {
           }
         }
 
+        // [§14 P3-1] 운영 튜닝용 저장 디바운스 오버라이드(하한 250ms — 실수 방지)
+        if (config && typeof config.saveDebounceMs === "number" && config.saveDebounceMs >= 250) {
+          saveDebounceRef.current = config.saveDebounceMs;
+        }
+
         if (config && config.activeDataPath) {
           setDbPath(config.activeDataPath);
           await fetchData(config.activeDataPath);
@@ -718,8 +785,8 @@ export default function App() {
                     path: fetchPath,
                   });
                   if ((check.rev ?? 0) > lastSaveRef.current) {
-                    // File was modified externally! Evaluate cell-level smart merge
-                    await executeSmartMerge(fetchPath);
+                    // [§14] 코얼레싱 + 사전판독(check) 재사용 — 중복 read_data 제거
+                    requestSmartMerge(fetchPath, check);
                   }
                 } catch (err) {
                   console.error(err);
@@ -842,9 +909,8 @@ export default function App() {
               const backoff =
                 Math.min(250 * 2 ** streak, 3000) + Math.random() * 250;
               setTimeout(() => {
-                executeSmartMerge(dbPath).catch((err) =>
-                  console.error("Backoff merge failed:", err),
-                );
+                // [§14] 코얼레싱 경유 — 감시자/폴링 트리거와 병합이 중복 실행되지 않음
+                requestSmartMerge(dbPath);
               }, backoff);
               return; // Early return to prevent overwriting lastSavedPayload with conflicting data
             } else if (String(e).includes("ITEM_LOCKED")) {
@@ -874,7 +940,7 @@ export default function App() {
         // We still saved it to localStorage, so update lastSavedPayload
         lastSavedPayload.current = newPayload;
       }
-    }, 1000); // Atomic write with debounce
+    }, saveDebounceRef.current); // Atomic write with debounce (기본 1000ms, app_config.saveDebounceMs로 조정 가능)
   }, [tabDataMap, tabs, assigneesPool, appName, dbPath, saveRetryNonce]); // Triggers when state changes or a deferred save retries
 
   // 4. Force flush on unload/visibilitychange
@@ -974,7 +1040,8 @@ export default function App() {
                     path: filePath,
                   });
                   if ((check.rev ?? 0) > lastSaveRef.current) {
-                    await executeSmartMerge(filePath);
+                    // [§14] 코얼레싱 + 사전판독 재사용
+                    requestSmartMerge(filePath, check);
                   }
                 } catch (err) {
                   console.error(err);
@@ -1075,7 +1142,8 @@ export default function App() {
                     path: filePath,
                   });
                   if ((check.rev ?? 0) > lastSaveRef.current) {
-                    await executeSmartMerge(filePath);
+                    // [§14] 코얼레싱 + 사전판독 재사용
+                    requestSmartMerge(filePath, check);
                   }
                 } catch (err) {
                   console.error(err);

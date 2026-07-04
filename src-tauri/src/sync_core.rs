@@ -61,11 +61,34 @@ impl CriticalSection {
                     return Ok(CriticalSection { lock_path });
                 }
                 Err(_) => {
-                    // 스테일 락 회수: 보유 프로세스가 죽어 정리되지 못한 경우
+                    // 스테일 락 회수: 보유 프로세스가 죽어 정리되지 못한 경우.
+                    // [§14 P2-R3] remove 기반 회수는 "스테일 판정 → remove" 사이에 락이
+                    // 신선한 것으로 교체되면 남의 살아있는 락을 지워 이중 진입을 허용할 수
+                    // 있었다(§9 R3). rename은 원자적이므로 회수권을 먼저 선점하고, 선점한
+                    // 파일의 mtime을 재검증해 신선했으면 원상 복구한다 — 살아있는 락이
+                    // 영구 삭제되는 경로가 사라진다.
                     if let Ok(meta) = fs::metadata(&lock_path) {
                         if let Ok(modified) = meta.modified() {
                             if modified.elapsed().unwrap_or_default() > CRITICAL_LOCK_STALE_AFTER {
-                                let _ = fs::remove_file(&lock_path);
+                                let claim_path = PathBuf::from(format!(
+                                    "{}.claim.{}",
+                                    lock_path.display(),
+                                    std::process::id()
+                                ));
+                                if fs::rename(&lock_path, &claim_path).is_ok() {
+                                    let still_stale = fs::metadata(&claim_path)
+                                        .and_then(|m| m.modified())
+                                        .ok()
+                                        .and_then(|mt| mt.elapsed().ok())
+                                        .map(|d| d > CRITICAL_LOCK_STALE_AFTER)
+                                        .unwrap_or(true);
+                                    if still_stale {
+                                        let _ = fs::remove_file(&claim_path);
+                                    } else {
+                                        // 그 사이 교체된 신선한 락을 선점한 것 — 원상 복구
+                                        let _ = fs::rename(&claim_path, &lock_path);
+                                    }
+                                }
                                 continue;
                             }
                         }
@@ -209,7 +232,8 @@ fn atomic_write(path: &str, data: &str) -> Result<(), String> {
 // 원래 itemId를 복원한다. 모든 락 함수(acquire/release/get_active_locks)가
 // 이 인코딩을 일괄 사용하므로 우회 경로가 없다.
 
-fn encode_lock_id(id: &str) -> String {
+/// (pub: main.rs의 changelog 파일명 등 다른 파일명 구성에도 재사용 — §14 R4)
+pub fn encode_lock_id(id: &str) -> String {
     let mut out = String::with_capacity(id.len());
     for c in id.chars() {
         let code = c as u32;
@@ -852,6 +876,43 @@ mod tests {
         assert!(
             after.contains(r#""_rev":5"#),
             "[수정 확인] 최신 데이터가 .bak(rev1)로 롤백되지 않아야 함. 실제={after}"
+        );
+    }
+
+    // ── [§14 P2-R3 수정 확인] 스테일 임계락이 원자적으로 회수되고 잔여물이 없음 ──
+    #[test]
+    fn p2r3_stale_critical_lock_is_reclaimed_atomically() {
+        let dir = unique_dir("p2r3_stale");
+        let path = dir.join("data.json");
+        let p = path.to_str().unwrap();
+        fs::write(&path, r#"{"tabDataMap":{}}"#).unwrap();
+
+        // 죽은 프로세스가 남긴 스테일 임계락을 재현: 락 파일 생성 후 mtime을 10초 과거로
+        let crit = dir.join("data.json.critical.lock");
+        fs::write(&crit, "99999").unwrap();
+        let past = std::time::SystemTime::now() - Duration::from_secs(10);
+        filetime::set_file_mtime(&crit, filetime::FileTime::from_system_time(past)).unwrap();
+
+        // 회수가 원자적으로 일어나 저장이 (5초 타임아웃 없이) 즉시 성공해야 함
+        let t0 = std::time::Instant::now();
+        let r = save_data_inner(p, r#"{"tabDataMap":{},"x":1}"#, 0, "userA");
+        assert_eq!(r, Ok(1), "스테일 임계락은 회수되고 저장이 성공해야 함");
+        assert!(
+            t0.elapsed() < Duration::from_secs(3),
+            "회수는 타임아웃 대기 없이 즉시 이루어져야 함. 소요={:?}",
+            t0.elapsed()
+        );
+
+        // 잔여물 검사: 저장 완료 후 critical.lock도 .claim.* 파일도 남아있지 않아야 함
+        let leftovers: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter_map(|e| e.file_name().to_str().map(String::from))
+            .filter(|n| n.contains(".critical.lock"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "회수/저장 후 락 잔여물이 없어야 함. 실제={leftovers:?}"
         );
     }
 

@@ -204,26 +204,36 @@ try {
     rec("B가 A 변경을 전파받음(파일감시+병합)", prop, `B 제목='${bT}'`);
 
     // 5) 충돌 시나리오: A·B가 같은 필드를 동시에 다르게 변경
-    // 결함#3 수정 확인: 예전엔 500ms 오차창 안에서 둘 다 조용히 성공(무한정 레이스)했으나,
-    // 이제는 _rev CAS로 정확히 한쪽만 성공하고 패자는 VERSION_CONFLICT를 실제로 받아야 한다.
+    // [결함#3 검증 — §14에서 단언을 "메커니즘"에서 "안전 속성"으로 전환]
+    // 코얼레싱+폴링 폴백(§14) 이후에는 수신 측이 자기 저장 전에 상대 변경을 병합해
+    // 원시 VERSION_CONFLICT 없이 해소되는 경우도 정상 경로다. 따라서 문자열 관측 대신
+    // 진짜 불변식을 단언한다: 정착 후 A 화면·B 화면·파일이 **같은 값으로 수렴**하고
+    // (무음 발산 없음), 그 값은 두 마커 중 하나여야 한다(무손실).
     log("[5] 충돌: A·B 동시 편집...");
     const preConflictLogCount = consoleLog.length;
     const mA = `A_${Date.now()}`, mB = `B_${Date.now()}`;
     await Promise.all([setInputByPlaceholder(pageA, TITLE_PH, mA), setInputByPlaceholder(pageB, TITLE_PH, mB)]);
-    await sleep(8000);
-    const finalFile = (() => { try { return fs.readFileSync(SHARED, "utf-8"); } catch { return ""; } })();
-    const keptA = finalFile.includes(mA), keptB = finalFile.includes(mB);
+
+    // 수렴 대기(최대 15초 폴링)
+    let convA = "", convB = "", convFileHasA = false, convFileHasB = false, converged = false;
+    for (let i = 0; i < 15; i++) {
+      await sleep(1000);
+      convA = (await getInputByPlaceholder(pageA, TITLE_PH)) || "";
+      convB = (await getInputByPlaceholder(pageB, TITLE_PH)) || "";
+      const f = (() => { try { return fs.readFileSync(SHARED, "utf-8"); } catch { return ""; } })();
+      convFileHasA = f.includes(mA); convFileHasB = f.includes(mB);
+      const fileMatchesUi = (convFileHasA && convA === mA && convB === mA) || (convFileHasB && convA === mB && convB === mB);
+      if (fileMatchesUi && (convFileHasA !== convFileHasB)) { converged = true; break; }
+    }
     const conflictA = await pageA.evaluate(() => document.body.innerText.includes("충돌")).catch(() => false);
     const conflictB = await pageB.evaluate(() => document.body.innerText.includes("충돌")).catch(() => false);
     const sawVersionConflict = consoleLog.slice(preConflictLogCount).some((l) => l.includes("VERSION_CONFLICT"));
-    log(`  최종파일: keptA=${keptA} keptB=${keptB} / 충돌모달: A=${conflictA} B=${conflictB} / VERSION_CONFLICT 로그 관측=${sawVersionConflict}`);
-    rec("[결함#3 수정 확인] 동시 편집 시 실제 VERSION_CONFLICT가 발생함(더 이상 무음 레이스 아님)", sawVersionConflict);
-    const observed = (conflictA || conflictB)
-      ? "충돌 모달 발생"
-      : (keptA !== keptB
-        ? "한쪽만 최종 반영 — 단, VERSION_CONFLICT→executeSmartMerge 경유를 거친 결정적 결과(mergeEngine의 탭 메타데이터 정책상 mine-wins, requirements 필드 충돌은 L1에서 별도 검증됨). 더 이상 레이스에 의한 '조용한' 유실이 아님."
-        : "동일 반영");
-    rec("충돌 시나리오 최종 결과(정보성)", true, observed);
+    log(`  수렴: A='${convA}' B='${convB}' 파일(A마커=${convFileHasA},B마커=${convFileHasB}) / 충돌모달: A=${conflictA} B=${conflictB} / VERSION_CONFLICT 관측=${sawVersionConflict}(정보성)`);
+    rec("[결함#3 수정 확인] 동시 편집이 무손실로 수렴(A·B·파일 동일, 마커 중 하나 생존, 무음 발산 없음)",
+      converged || conflictA || conflictB,
+      converged ? `'${convA}'로 수렴` : (conflictA || conflictB ? "충돌 모달로 사용자 중재" : "15초 내 미수렴"));
+    rec("충돌 해소 경로(정보성)", true,
+      sawVersionConflict ? "CAS 거부 → 병합 재시도 경유" : "선제 병합으로 CAS 충돌 없이 해소(코얼레싱+폴링 폴백 효과)");
 
     // 6) 결함#4 수정 확인: 아이템 락 보유 중인 요구항목을 건드리는 저장은 ITEM_LOCKED로 거부되어야 함
     // rev CAS 통과가 전제이므로, 배경 자동저장/병합 재시도로 rev가 계속 바뀌는 동안에는

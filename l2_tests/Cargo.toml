@@ -9,3 +9,7 @@ publish = false
 
 [dependencies]
 serde_json = "1.0"
+
+[dev-dependencies]
+# 테스트에서 락 파일 mtime을 백데이트해 스테일 상태를 즉시 재현하기 위함(§14 P2-R3)
+filetime = "0.2"
