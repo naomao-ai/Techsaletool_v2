@@ -12,6 +12,22 @@ export interface Assignee {
   avatarUrl: string;
 }
 
+/**
+ * 셀 텍스트 일부에 적용되는 서식 구간(run).
+ * [start, end) 반열림 구간의 문자에 서식을 지정한다. 텍스트 자체(title/customColumns)는
+ * 순수 문자열 정본으로 그대로 두고, 서식은 이 부가 레이어에만 담아 다중 사용자 병합·검색·
+ * 정렬 호환성을 유지한다(서식은 최악의 경우에도 "상대 우선"으로 수렴, 텍스트는 3-way 병합).
+ */
+export interface TextRun {
+  start: number;
+  end: number;
+  bold?: boolean;
+  color?: string;
+  underline?: boolean;
+  strike?: boolean;
+  size?: number; // 절대 px. 없으면 셀 기본 크기 상속.
+}
+
 export interface Requirement {
   id: string;
   title: string;
@@ -20,6 +36,8 @@ export interface Requirement {
   dueDate: string;
   status: Status;
   customColumns?: Record<string, string>;
+  // 필드/컬럼 id(예: "title" 또는 커스텀 컬럼 id) → 서식 구간 배열.
+  richText?: Record<string, TextRun[]>;
 }
 
 export type ColumnType = 'text' | 'number' | 'date' | 'checkbox' | 'select' | 'relation' | 'rollup' | 'formula' | 'button' | 'status' | 'currency_usd' | 'lookup' | 'inflation_pv';

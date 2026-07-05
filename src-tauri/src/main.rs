@@ -140,29 +140,43 @@ async fn get_active_locks(project_path: String) -> Result<serde_json::Value, Str
     sync_core::get_active_locks_inner(&project_path)
 }
 
+// [§14 R4 최적화] changelog 동시 append 경합 제거 — 사용자별 파일 분리.
+// 기존에는 10명이 같은 `날짜.jsonl`에 무잠금 append하여 SMB에서 라인 인터리브/유실이
+// 가능했다(§9 R4). 이제 각 사용자가 자기 파일(`날짜_사용자ID.jsonl`)에만 append하므로
+// 파일당 작성자가 1명 = 경합이 원천 제거된다. 읽기는 해당 날짜의 모든 파일(레거시
+// `날짜.jsonl` 포함)을 집계해 timestamp로 정렬 — 하위호환 유지.
 #[tauri::command]
 async fn append_changelog(project_path: String, log_entry: serde_json::Value) -> Result<(), String> {
     use std::io::Write;
     let path = Path::new(&project_path);
     let parent = path.parent().ok_or("Invalid path")?;
-    
+
     let logs_dir = parent.join("changelogs");
     if !logs_dir.exists() {
         fs::create_dir_all(&logs_dir).map_err(|e| e.to_string())?;
     }
-    
+
     let now = chrono::Local::now();
     let date_str = now.format("%Y-%m-%d").to_string();
-    let log_file = logs_dir.join(format!("{}.jsonl", date_str));
-    
+    let user_id = log_entry
+        .get("userId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    // 파일명 안전 인코딩(결함#8과 동일 규칙) — userId에 금지 문자가 있어도 안전
+    let log_file = logs_dir.join(format!(
+        "{}_{}.jsonl",
+        date_str,
+        sync_core::encode_lock_id(user_id)
+    ));
+
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(log_file)
         .map_err(|e| e.to_string())?;
-        
+
     writeln!(file, "{}", log_entry.to_string()).map_err(|e| e.to_string())?;
-    
+
     Ok(())
 }
 
@@ -170,20 +184,36 @@ async fn append_changelog(project_path: String, log_entry: serde_json::Value) ->
 async fn read_changelog(project_path: String, date_str: String) -> Result<Vec<serde_json::Value>, String> {
     let path = Path::new(&project_path);
     let parent = path.parent().ok_or("Invalid path")?;
-    
-    let log_file = parent.join("changelogs").join(format!("{}.jsonl", date_str));
-    if !log_file.exists() {
+    let logs_dir = parent.join("changelogs");
+    if !logs_dir.exists() {
         return Ok(vec![]);
     }
-    
-    let content = fs::read_to_string(&log_file).map_err(|e| e.to_string())?;
+
+    // 해당 날짜의 모든 changelog 파일 집계: 레거시 `날짜.jsonl` + 사용자별 `날짜_*.jsonl`
+    let legacy_name = format!("{}.jsonl", date_str);
+    let user_prefix = format!("{}_", date_str);
     let mut logs = Vec::new();
-    for line in content.lines() {
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(line) {
-            logs.push(json);
+    if let Ok(entries) = fs::read_dir(&logs_dir) {
+        for entry in entries.flatten() {
+            let file_path = entry.path();
+            let Some(name) = file_path.file_name().and_then(|n| n.to_str()) else { continue };
+            let matches = name == legacy_name
+                || (name.starts_with(&user_prefix) && name.ends_with(".jsonl"));
+            if !matches {
+                continue;
+            }
+            if let Ok(content) = fs::read_to_string(&file_path) {
+                for line in content.lines() {
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(line) {
+                        logs.push(json);
+                    }
+                }
+            }
         }
     }
-    
+    // 여러 파일에서 모았으므로 timestamp로 시간순 정렬(뷰어 표시 순서 보존)
+    logs.sort_by_key(|l| l.get("timestamp").and_then(|t| t.as_u64()).unwrap_or(0));
+
     Ok(logs)
 }
 

@@ -51,6 +51,21 @@ export function computeSmartMerge(
   const myData = mine;
   const theirData = theirs;
 
+  // [결함 #9 수정] 부분/불완전 페이로드 방어.
+  // 어떤 쪽 스냅샷에 `tabs`/`tabDataMap` **키 자체가 없으면**(외부 도구·스크립트의 부분
+  // 저장, 구버전, 손상 등) 그것은 "모든 탭/항목을 삭제했다"는 의사표시가 아니라 정보
+  // 부재다. 기존에는 `|| []` 폴백 때문에 삭제 필터가 base의 모든 탭·요구항목을
+  // "상대가 삭제함"으로 오판해 tabs:[]를 만들어 공유 파일에 영구 기록했고(→ 이후 모든
+  // 클라이언트가 로드 즉시 렌더 크래시), 실제 L4 잔존 파일 3개에서 실증됐다(§11).
+  // 키가 없으면 base(변경 없음)로 간주한다. 정상 앱 저장은 항상 두 키를 포함하므로
+  // 실사용 병합 의미는 변하지 않는다.
+  const theirTabsArr: any[] = Array.isArray(theirData.tabs)
+    ? theirData.tabs
+    : baseData.tabs || [];
+  const myTabsArr: any[] = Array.isArray(myData.tabs)
+    ? myData.tabs
+    : baseData.tabs || [];
+
   const conflicts: MergeConflict[] = [];
   const mergedMap: Record<string, any> = {};
 
@@ -59,14 +74,14 @@ export function computeSmartMerge(
   const baseTabIds = finalTabs.map((t) => t.id);
 
   // Add their new tabs and apply their edits
-  (theirData.tabs || []).forEach((theirT: any) => {
+  theirTabsArr.forEach((theirT: any) => {
     const idx = finalTabs.findIndex((t) => t.id === theirT.id);
     if (idx === -1) finalTabs.push(theirT);
     else finalTabs[idx] = { ...finalTabs[idx], ...theirT };
   });
 
   // Add my new tabs and apply my edits
-  (myData.tabs || []).forEach((myT: any) => {
+  myTabsArr.forEach((myT: any) => {
     const idx = finalTabs.findIndex((t) => t.id === myT.id);
     if (idx === -1) finalTabs.push(myT);
     else {
@@ -81,29 +96,46 @@ export function computeSmartMerge(
   // Remove tabs deleted by either
   finalTabs = finalTabs.filter((t) => {
     const inBase = baseTabIds.includes(t.id);
-    const deletedByThem = inBase && !(theirData.tabs || []).find((x: any) => x.id === t.id);
-    const deletedByMe = inBase && !(myData.tabs || []).find((x: any) => x.id === t.id);
+    const deletedByThem = inBase && !theirTabsArr.find((x: any) => x.id === t.id);
+    const deletedByMe = inBase && !myTabsArr.find((x: any) => x.id === t.id);
     return !(deletedByThem || deletedByMe);
   });
 
   Object.keys({ ...theirData.tabDataMap, ...myData.tabDataMap }).forEach((tabId) => {
-    const myTab = myData.tabDataMap?.[tabId] || {
-      requirements: [],
-      columns: DEFAULT_COLUMNS,
-    };
-    const theirTab = theirData.tabDataMap?.[tabId] || {
-      requirements: [],
-      columns: DEFAULT_COLUMNS,
-    };
     const baseTab = baseData.tabDataMap?.[tabId] || {
       requirements: [],
       columns: DEFAULT_COLUMNS,
     };
+    // [결함 #9 수정] 스냅샷에 이 탭의 tabDataMap 엔트리가 없으면 "해당 탭의 모든
+    // 요구항목 삭제"가 아니라 "변경 없음(base 그대로)"으로 간주. 탭 삭제는 tabs
+    // 배열로 별도 표현되므로, 엔트리 부재를 대량 삭제로 볼 근거가 없다.
+    const myTab = myData.tabDataMap?.[tabId] ?? baseTab;
+    const theirTab = theirData.tabDataMap?.[tabId] ?? baseTab;
 
-    let mergedReqs = [...theirTab.requirements];
-    const baseReqIds = (baseTab.requirements || []).map((r: any) => r.id);
-    const theirReqIds = (theirTab.requirements || []).map((r: any) => r.id);
-    const myReqIds = (myTab.requirements || []).map((r: any) => r.id);
+    let mergedReqs = [...(theirTab.requirements || [])];
+    // [P3-2 최적화, §14] 요구항목 조회를 배열 선형 탐색(findIndex/includes, O(n²))에서
+    // Map/Set(O(n))으로 교체. N=10,000에서 병합 1,198ms → 수십 ms 수준으로 단축.
+    // 동작은 동일 — L1 14케이스가 가드.
+    const baseReqById = new Map(
+      (baseTab.requirements || []).map((r: any) => [r.id, r]),
+    );
+    const theirReqIdSet = new Set(
+      (theirTab.requirements || []).map((r: any) => r.id),
+    );
+    const myReqIdSet = new Set((myTab.requirements || []).map((r: any) => r.id));
+    const mergedIdxById = new Map(
+      mergedReqs.map((r: any, i: number) => [r.id, i]),
+    );
+    // 신규 ID 재번호용 최대 번호 — 기존에는 충돌 시마다 전체 reduce(O(n))였던 것을
+    // 1회 계산 후 push 시 증분 갱신으로 대체(결과 동일).
+    let maxNumericId = mergedReqs.reduce((max: number, r: any) => {
+      const m = String(r.id).match(/REQ-(\d+)/);
+      return m ? Math.max(max, parseInt(m[1], 10)) : max;
+    }, 0);
+    const trackMax = (id: any) => {
+      const m = String(id).match(/REQ-(\d+)/);
+      if (m) maxNumericId = Math.max(maxNumericId, parseInt(m[1], 10));
+    };
     let mergedCols = [...(baseTab.columns || [])];
     const baseColIds = mergedCols.map((c: any) => c.id);
     const theirColIds = (theirTab.columns || []).map((c: any) => c.id);
@@ -137,21 +169,23 @@ export function computeSmartMerge(
       return !(deletedByThem || deletedByMe);
     });
 
-    myTab.requirements.forEach((myReq: any) => {
-      const baseReq = baseTab.requirements.find((r: any) => r.id === myReq.id);
-      const theirReqIndex = mergedReqs.findIndex((r: any) => r.id === myReq.id);
+    (myTab.requirements || []).forEach((myReq: any) => {
+      const baseReq = baseReqById.get(myReq.id);
+      const theirReqIndex = mergedIdxById.has(myReq.id)
+        ? (mergedIdxById.get(myReq.id) as number)
+        : -1;
 
       if (!baseReq) {
         if (theirReqIndex === -1) {
+          mergedIdxById.set(myReq.id, mergedReqs.length);
           mergedReqs.push(myReq);
+          trackMax(myReq.id);
         } else {
           // Duplicate ID collision
-          let maxNumericId = mergedReqs.reduce((max, r) => {
-            const match = String(r.id).match(/REQ-(\d+)/);
-            return match ? Math.max(max, parseInt(match[1], 10)) : max;
-          }, 0);
           const nextId = `REQ-${String(maxNumericId + 1).padStart(3, "0")}`;
+          mergedIdxById.set(nextId, mergedReqs.length);
           mergedReqs.push({ ...myReq, id: nextId });
+          trackMax(nextId);
         }
       } else {
         if (theirReqIndex !== -1) {
@@ -237,9 +271,9 @@ export function computeSmartMerge(
     // base에 있었고(inBase) 어느 한쪽이 삭제한 항목은 병합 결과에서 제거한다.
     // (base에 없던 신규 항목·재번호 항목은 inBase=false 이므로 영향 없음)
     mergedReqs = mergedReqs.filter((r: any) => {
-      const inBase = baseReqIds.includes(r.id);
-      const deletedByThem = inBase && !theirReqIds.includes(r.id);
-      const deletedByMe = inBase && !myReqIds.includes(r.id);
+      const inBase = baseReqById.has(r.id);
+      const deletedByThem = inBase && !theirReqIdSet.has(r.id);
+      const deletedByMe = inBase && !myReqIdSet.has(r.id);
       return !(deletedByThem || deletedByMe);
     });
 

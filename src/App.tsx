@@ -149,7 +149,10 @@ const DEFAULT_TABS: TabItem[] = [
 
 export default function App() {
   const applyData = (parsed: any) => {
-    if (parsed.tabs) {
+    // [결함 #9 수정] tabs가 빈 배열이면(과거 병합 결함으로 오염된 파일 등) 적용하지 않고
+    // 기존/기본 탭을 유지 — 앱은 최소 1개 탭을 전제하며, UI상 모든 탭을 삭제하는 경로도
+    // 없으므로 빈 배열은 항상 손상 신호다. 다음 저장이 정상 tabs를 파일에 복원한다(자가 치유).
+    if (Array.isArray(parsed.tabs) && parsed.tabs.length > 0) {
       setTabs(
         parsed.tabs.map((t: TabItem) => {
           if (t.id === "ce_dashboard_example" && !t.ceDashboardConfigs) {
@@ -376,6 +379,25 @@ export default function App() {
   const dataPayloadRef = useRef("");
   const syncTimerRef = useRef<any>(null);
 
+  // §9 T2/R5 수정: 저장 경합 대응.
+  // - conflictStreakRef: 연속 VERSION_CONFLICT 횟수 — 지수 백오프 계산용(다중 사용자
+  //   동시 충돌 시 전원이 동시에 재시도하는 thundering herd 방지, 지터 포함).
+  // - saveRetryNonce/saveRetryTimerRef: ITEM_LOCKED/LOCK_TIMEOUT으로 저장이 보류됐을 때
+  //   상태 변경이 더 없어도 자동으로 재시도하도록 저장 이펙트를 재점화하는 논스.
+  const conflictStreakRef = useRef(0);
+  // [§14 P3-1] 저장 디바운스 설정값화 — 기본 1000ms(기존과 동일). 10인 이상 환경에서
+  // 저장 경합이 심하면 app_config.saveDebounceMs(예: 2000)로 조정 가능(initServer에서 로드).
+  const saveDebounceRef = useRef(1000);
+  const saveRetryTimerRef = useRef<any>(null);
+  const [saveRetryNonce, setSaveRetryNonce] = useState(0);
+  const scheduleSaveRetry = (delayMs: number) => {
+    if (saveRetryTimerRef.current) return; // 단일 타이머만 유지
+    saveRetryTimerRef.current = setTimeout(() => {
+      saveRetryTimerRef.current = null;
+      setSaveRetryNonce((n) => n + 1);
+    }, delayMs);
+  };
+
   // Future feature modal states
   const [comingSoonFeature, setComingSoonFeature] = useState<string | null>(
     null,
@@ -383,11 +405,16 @@ export default function App() {
   const [feedbackText, setFeedbackText] = useState("");
   const [showSuccessToast, setShowSuccessToast] = useState(false);
 
-  const executeSmartMerge = async (serverPath: string) => {
+  // [§14 T3+IO 최적화] preRead: 감시자/폴링이 방금 read_data한 응답을 그대로 넘겨받아
+  // 병합 내부의 중복 read_data를 생략한다(원격 변경 1건당 NAS 읽기 2회→1회).
+  // preRead가 코얼레싱 지연만큼 오래됐어도 안전 — 저장은 _rev CAS로 보호되므로
+  // 최악의 경우 VERSION_CONFLICT 1회 후 재병합으로 수렴한다.
+  const executeSmartMerge = async (serverPath: string, preRead?: any) => {
     try {
       // @ts-ignore
       const { invoke } = await import("@tauri-apps/api/core");
-      const response: any = await invoke("read_data", { path: serverPath });
+      const response: any =
+        preRead ?? (await invoke("read_data", { path: serverPath }));
       const theirData = response.data;
       if (!theirData) return;
       const theirRev = response.rev ?? 0;
@@ -469,8 +496,48 @@ export default function App() {
     }
   };
 
+  // [§14 T3 최적화] 병합 코얼레싱 — 파일 감시자/폴링이 연속으로 변경을 알릴 때
+  // (10인 환경에선 초당 수 회) 매 이벤트마다 병합하지 않고 400ms 창으로 묶어 1회만
+  // 실행한다. 병합이 이미 진행 중이면 종료 후 1회 더 실행(pending)해 마지막 변경을
+  // 놓치지 않는다. preRead는 가장 최신 것 하나만 유지.
+  const mergeCoalesceTimerRef = useRef<any>(null);
+  const mergeInFlightRef = useRef(false);
+  const mergePendingRef = useRef<string | null>(null);
+  const mergePreReadRef = useRef<any>(null);
+  const requestSmartMerge = (serverPath: string, preRead?: any) => {
+    if (preRead) mergePreReadRef.current = preRead;
+    if (mergeInFlightRef.current) {
+      mergePendingRef.current = serverPath;
+      return;
+    }
+    if (mergeCoalesceTimerRef.current) return; // 이미 예약됨 — 이번 이벤트는 흡수
+    mergeCoalesceTimerRef.current = setTimeout(async () => {
+      mergeCoalesceTimerRef.current = null;
+      mergeInFlightRef.current = true;
+      const pre = mergePreReadRef.current;
+      mergePreReadRef.current = null;
+      try {
+        await executeSmartMerge(serverPath, pre);
+      } finally {
+        mergeInFlightRef.current = false;
+        if (mergePendingRef.current) {
+          const p = mergePendingRef.current;
+          mergePendingRef.current = null;
+          requestSmartMerge(p); // 진행 중 쌓인 변경 1회 더 반영(신선한 재판독)
+        }
+      }
+    }, 400);
+  };
+
   // 2. Fetch Server Config Loading
   // 1. Polling Locks
+  // [§14 R6 최적화] 락 폴링 + 전파 폴백 하이브리드.
+  // 일부 NAS(Samba 설정)는 디렉터리 change-notify를 지원하지 않아 파일 감시자가
+  // 조용히 침묵할 수 있다(§9 R6). 이미 2초마다 도는 락 폴링 인터벌에 mtime 힌트
+  // 검사(메타데이터만, 파일 본문 미판독)를 얹어, mtime이 움직였을 때만 read_data로
+  // rev를 확인하고 앞서 있으면 병합을 트리거한다 — 감시자가 죽어도 최대 ~2.4초
+  // 안에 전파가 보장되고, 정상 경로에선 추가 비용이 메타데이터 조회 1회뿐이다.
+  const lastPolledMtimeRef = useRef<number>(0);
   useEffect(() => {
     // @ts-ignore
     const isTauri = !!(("__TAURI_INTERNALS__" in window) || ("__TAURI_IPC__" in window));
@@ -487,6 +554,20 @@ export default function App() {
             if (JSON.stringify(prev) === JSON.stringify(newLocks)) return prev;
             return newLocks;
           });
+
+          // 전파 폴백: mtime은 변경 "힌트"로만 사용(판정은 언제나 _rev CAS)
+          try {
+            const mtime: number = await invoke("get_file_modified_time_native", {
+              path: dbPath,
+            });
+            if (mtime !== lastPolledMtimeRef.current) {
+              lastPolledMtimeRef.current = mtime;
+              const check: any = await invoke("read_data", { path: dbPath });
+              if ((check.rev ?? 0) > lastSaveRef.current) {
+                requestSmartMerge(dbPath, check);
+              }
+            }
+          } catch {}
         } catch (e) {}
       }, 2000);
       return () => clearInterval(interval);
@@ -623,6 +704,11 @@ export default function App() {
           }
         }
 
+        // [§14 P3-1] 운영 튜닝용 저장 디바운스 오버라이드(하한 250ms — 실수 방지)
+        if (config && typeof config.saveDebounceMs === "number" && config.saveDebounceMs >= 250) {
+          saveDebounceRef.current = config.saveDebounceMs;
+        }
+
         if (config && config.activeDataPath) {
           setDbPath(config.activeDataPath);
           await fetchData(config.activeDataPath);
@@ -699,8 +785,8 @@ export default function App() {
                     path: fetchPath,
                   });
                   if ((check.rev ?? 0) > lastSaveRef.current) {
-                    // File was modified externally! Evaluate cell-level smart merge
-                    await executeSmartMerge(fetchPath);
+                    // [§14] 코얼레싱 + 사전판독(check) 재사용 — 중복 read_data 제거
+                    requestSmartMerge(fetchPath, check);
                   }
                 } catch (err) {
                   console.error(err);
@@ -803,6 +889,7 @@ export default function App() {
               userId: currentUser.id,
             });
             if (newModified) lastSaveRef.current = newModified;
+            conflictStreakRef.current = 0; // 저장 성공 → 백오프 리셋
 
             await invoke("append_changelog", {
               projectPath: dbPath,
@@ -816,12 +903,28 @@ export default function App() {
           } catch (e: any) {
             console.error("Tauri save failed", e);
             if (String(e).includes("VERSION_CONFLICT")) {
-              await executeSmartMerge(dbPath);
+              // §9 T2 수정: 즉시 재시도하지 않고 지수 백오프+지터 후 병합 —
+              // 여러 사용자가 동시에 충돌했을 때 재시도가 서로 겹치지 않게 분산시킨다.
+              const streak = conflictStreakRef.current++;
+              const backoff =
+                Math.min(250 * 2 ** streak, 3000) + Math.random() * 250;
+              setTimeout(() => {
+                // [§14] 코얼레싱 경유 — 감시자/폴링 트리거와 병합이 중복 실행되지 않음
+                requestSmartMerge(dbPath);
+              }, backoff);
               return; // Early return to prevent overwriting lastSavedPayload with conflicting data
             } else if (String(e).includes("ITEM_LOCKED")) {
               // 결함#4 수정: 타 사용자가 편집 중인 항목이 있어 저장이 거부됨.
-              // lastSavedPayload를 갱신하지 않아 다음 상태 변경 시 자동 재시도된다.
-              setSyncError("다른 사용자가 편집 중인 항목이 있어 저장이 보류되었습니다. 편집이 끝나면 자동으로 다시 저장됩니다.");
+              // §9 R5 수정: 상태 변경이 더 없어도 3초 후 자동 재시도(락 TTL 최대 15초이므로
+              // 곧 해소됨). lastSavedPayload를 갱신하지 않아 재시도 시 같은 내용이 저장된다.
+              setSyncError("다른 사용자가 편집 중인 항목이 있어 저장이 보류되었습니다. 잠시 후 자동으로 다시 저장됩니다.");
+              scheduleSaveRetry(3000);
+              return;
+            } else if (String(e).includes("LOCK_TIMEOUT")) {
+              // §9 T1 수정: 공유 파일 임계구역 혼잡은 "오프라인"이 아니라 일시적 대기 상태 —
+              // 사용자에게 정확히 알리고 지터를 섞어 자동 재시도한다.
+              setSyncError("공유 파일 사용량이 많아 저장 대기 중입니다. 자동으로 다시 시도합니다.");
+              scheduleSaveRetry(1500 + Math.random() * 1500);
               return;
             } else {
               throw e;
@@ -837,8 +940,8 @@ export default function App() {
         // We still saved it to localStorage, so update lastSavedPayload
         lastSavedPayload.current = newPayload;
       }
-    }, 1000); // Atomic write with debounce
-  }, [tabDataMap, tabs, assigneesPool, appName, dbPath]); // Triggers when state changes
+    }, saveDebounceRef.current); // Atomic write with debounce (기본 1000ms, app_config.saveDebounceMs로 조정 가능)
+  }, [tabDataMap, tabs, assigneesPool, appName, dbPath, saveRetryNonce]); // Triggers when state changes or a deferred save retries
 
   // 4. Force flush on unload/visibilitychange
   useEffect(() => {
@@ -937,7 +1040,8 @@ export default function App() {
                     path: filePath,
                   });
                   if ((check.rev ?? 0) > lastSaveRef.current) {
-                    await executeSmartMerge(filePath);
+                    // [§14] 코얼레싱 + 사전판독 재사용
+                    requestSmartMerge(filePath, check);
                   }
                 } catch (err) {
                   console.error(err);
@@ -1038,7 +1142,8 @@ export default function App() {
                     path: filePath,
                   });
                   if ((check.rev ?? 0) > lastSaveRef.current) {
-                    await executeSmartMerge(filePath);
+                    // [§14] 코얼레싱 + 사전판독 재사용
+                    requestSmartMerge(filePath, check);
                   }
                 } catch (err) {
                   console.error(err);
@@ -1230,8 +1335,11 @@ export default function App() {
             <BoardPage boardItems={boardItems} setBoardItems={setBoardItems} />
           ) : (
             (() => {
+              // [결함 #9 수정] tabs가 비어 있어도(오염된 공유 파일 등) 렌더가 크래시하지
+              // 않도록 기본 탭으로 폴백 — 크래시 대신 기본 화면을 보여주고, 다음 저장이
+              // 정상 tabs를 파일에 복원한다.
               const activeTabInfo =
-                tabs.find((t) => t.id === currentTab) || tabs[0];
+                tabs.find((t) => t.id === currentTab) || tabs[0] || DEFAULT_TABS[0];
               const tData = tabDataMap[currentTab] || {
                 requirements: [],
                 columns: DEFAULT_COLUMNS,

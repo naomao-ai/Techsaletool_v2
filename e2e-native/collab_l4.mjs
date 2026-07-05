@@ -200,25 +200,28 @@ try {
     log("  [진단] A DOM:", JSON.stringify(diag));
   } else {
     // 5) 아이템 락(locks/) — NAS 경로 위에서 획득/조회 확인
-    log("[5] 아이템 락(locks/) NAS 경로 검증...");
+    // 결함#8 수정 검증: 실 UI와 동일한 "탭ID:행ID"(콜론) 형식 사용. 콜론은 파일명에서
+    // %3A로 인코딩되어 저장되고, 스캔 시 원래 키로 디코딩되어야 한다.
+    log("[5] 아이템 락(locks/) NAS 경로 검증(실 UI 콜론 형식)...");
+    const L4_LOCK_ID = "requirements:L4-TEST-1";
     const lockAcq = await invokeRaw(pageA, "acquire_item_lock", {
-      projectPath: SHARED_PATH_FOR_APP, itemId: "L4-TEST-1", userId: "userA", userName: "사용자A",
+      projectPath: SHARED_PATH_FOR_APP, itemId: L4_LOCK_ID, userId: "userA", userName: "사용자A",
     });
-    rec("A가 NAS 경로에 아이템 락 획득", lockAcq.ok && lockAcq.res === true, JSON.stringify(lockAcq));
+    rec("A가 NAS 경로에 콜론 형식 아이템 락 획득", lockAcq.ok && lockAcq.res === true, JSON.stringify(lockAcq));
 
     const activeLocks = await invokeRaw(pageB, "get_active_locks", { projectPath: SHARED_PATH_FOR_APP });
-    const seenByB = activeLocks.ok && activeLocks.res && activeLocks.res["L4-TEST-1"];
-    rec("B가 NAS 경로에서 A의 락을 조회(파일 기반 락 가시성)", !!seenByB, JSON.stringify(activeLocks));
+    const seenByB = activeLocks.ok && activeLocks.res && activeLocks.res[L4_LOCK_ID];
+    rec("[결함#8 수정 확인] B가 NAS 경로에서 콜론 락을 원래 키로 조회(가시성 복원)", !!seenByB, JSON.stringify(activeLocks));
 
-    const lockFileExists = fs.existsSync(path.join(LOCKS, "item_L4-TEST-1.lock"));
-    rec("locks/item_L4-TEST-1.lock 파일이 NAS 경로에 실제 생성됨", lockFileExists);
+    const lockFileExists = fs.existsSync(path.join(LOCKS, "item_requirements%3AL4-TEST-1.lock"));
+    rec("[결함#8 수정 확인] 인코딩된 락 파일(item_requirements%3AL4-TEST-1.lock)이 실제 생성됨", lockFileExists);
 
     const lockConflict = await invokeRaw(pageB, "acquire_item_lock", {
-      projectPath: SHARED_PATH_FOR_APP, itemId: "L4-TEST-1", userId: "userB", userName: "사용자B",
+      projectPath: SHARED_PATH_FOR_APP, itemId: L4_LOCK_ID, userId: "userB", userName: "사용자B",
     });
     rec("B가 A 보유 락에 대해 획득 거부됨(충돌 정상)", !lockConflict.ok, JSON.stringify(lockConflict));
 
-    await invokeRaw(pageA, "release_item_lock", { projectPath: SHARED_PATH_FOR_APP, itemId: "L4-TEST-1", userId: "userA" });
+    await invokeRaw(pageA, "release_item_lock", { projectPath: SHARED_PATH_FOR_APP, itemId: L4_LOCK_ID, userId: "userA" });
 
     // 6) 협업 전파: A가 제목 편집 → 공유파일(NAS) 반영 → B 전파
     const marker = `L4COLLAB_${Date.now()}`;
@@ -234,22 +237,33 @@ try {
     const bT = await getInputByPlaceholder(pageB, TITLE_PH);
     rec("B가 NAS 경로 파일감시(notify)로 A 변경 전파받음", prop, `B 제목='${bT}'`);
 
-    // 7) 충돌 시나리오 — 결함#3 수정 확인: NAS(네트워크) 경로에서도 VERSION_CONFLICT가
-    // 실제로 발생해야 한다(더 이상 mtime 500ms 창에 의한 무음 레이스가 아님).
+    // 7) 충돌 시나리오 — [결함#3 검증, §14에서 안전 속성 단언으로 전환]
+    // 코얼레싱+폴링 폴백 이후 원시 VERSION_CONFLICT 없이 선제 병합으로 해소되는 것도
+    // 정상 경로이므로, "무손실 수렴"(A·B·파일 동일 값, 마커 중 하나 생존)을 단언한다.
     log("[7] 충돌: A·B 동시 편집(NAS 경로)...");
     const preConflictLogCount = consoleLog.length;
     const mA = `A_${Date.now()}`, mB = `B_${Date.now()}`;
     await Promise.all([setInputByPlaceholder(pageA, TITLE_PH, mA), setInputByPlaceholder(pageB, TITLE_PH, mB)]);
-    await sleep(8000);
-    const finalFile = (() => { try { return fs.readFileSync(SHARED_PATH_FOR_APP, "utf-8"); } catch { return ""; } })();
-    const keptA = finalFile.includes(mA), keptB = finalFile.includes(mB);
+
+    let convA = "", convB = "", convFileHasA = false, convFileHasB = false, converged = false;
+    for (let i = 0; i < 15; i++) {
+      await sleep(1000);
+      convA = (await getInputByPlaceholder(pageA, TITLE_PH)) || "";
+      convB = (await getInputByPlaceholder(pageB, TITLE_PH)) || "";
+      const f = (() => { try { return fs.readFileSync(SHARED_PATH_FOR_APP, "utf-8"); } catch { return ""; } })();
+      convFileHasA = f.includes(mA); convFileHasB = f.includes(mB);
+      const fileMatchesUi = (convFileHasA && convA === mA && convB === mA) || (convFileHasB && convA === mB && convB === mB);
+      if (fileMatchesUi && (convFileHasA !== convFileHasB)) { converged = true; break; }
+    }
     const conflictA = await pageA.evaluate(() => document.body.innerText.includes("충돌")).catch(() => false);
     const conflictB = await pageB.evaluate(() => document.body.innerText.includes("충돌")).catch(() => false);
     const sawVersionConflict = consoleLog.slice(preConflictLogCount).some((l) => l.includes("VERSION_CONFLICT"));
-    log(`  최종파일: keptA=${keptA} keptB=${keptB} / 충돌모달: A=${conflictA} B=${conflictB} / VERSION_CONFLICT 로그 관측=${sawVersionConflict}`);
-    rec("[결함#3 수정 확인] NAS 경로에서도 동시 편집 시 VERSION_CONFLICT 발생", sawVersionConflict);
-    const observed = (conflictA || conflictB) ? "충돌 모달 발생" : (keptA !== keptB ? "한쪽만 최종 반영(CAS-안전 경유, 무음 레이스 아님)" : (keptA && keptB ? "동일 반영" : "둘 다 미반영(이상)"));
-    rec("충돌 시나리오 최종 결과(정보성, NAS 경로)", true, observed);
+    log(`  수렴: A='${convA}' B='${convB}' 파일(A마커=${convFileHasA},B마커=${convFileHasB}) / 충돌모달: A=${conflictA} B=${conflictB} / VERSION_CONFLICT 관측=${sawVersionConflict}(정보성)`);
+    rec("[결함#3 수정 확인] NAS 경로에서 동시 편집이 무손실로 수렴(무음 발산 없음)",
+      converged || conflictA || conflictB,
+      converged ? `'${convA}'로 수렴` : (conflictA || conflictB ? "충돌 모달로 사용자 중재" : "15초 내 미수렴"));
+    rec("충돌 해소 경로(정보성, NAS 경로)", true,
+      sawVersionConflict ? "CAS 거부 → 병합 재시도 경유" : "선제 병합으로 CAS 충돌 없이 해소(코얼레싱+폴링 폴백 효과)");
 
     // 8) 결함#4 수정 확인: NAS 경로에서도 아이템 락 보유 항목 저장이 ITEM_LOCKED로 거부되는지
     // 결함#4 검증은 rev CAS 통과가 전제라, 배경에서 진행 중인 자동저장(디바운스)·병합
@@ -257,9 +271,9 @@ try {
     // 그래서 저장 시도 직전에 매번 rev를 새로 읽고, 우연한 VERSION_CONFLICT는 재시도한다.
     log("[8] 결함#4 검증: NAS 경로에서 아이템 락 vs save_data...");
     const lockAcq2 = await invokeRaw(pageA, "acquire_item_lock", {
-      projectPath: SHARED_PATH_FOR_APP, itemId: "REQ-LOCK-TEST-L4", userId: "userA", userName: "사용자A",
+      projectPath: SHARED_PATH_FOR_APP, itemId: "t_locktest:REQ-LOCK-TEST-L4", userId: "userA", userName: "사용자A",
     });
-    rec("A가 NAS 경로에서 REQ-LOCK-TEST-L4 락 획득", lockAcq2.ok && lockAcq2.res === true);
+    rec("A가 NAS 경로에서 실 UI 형식 락 획득", lockAcq2.ok && lockAcq2.res === true);
 
     const conflictingPayload = JSON.stringify({ tabDataMap: { t_locktest: { requirements: [{ id: "REQ-LOCK-TEST-L4", title: "B가 덮어쓰기 시도" }] } } });
     let bSaveAttempt = null;
@@ -273,11 +287,11 @@ try {
       if (!bSaveAttempt.ok && String(bSaveAttempt.error).includes("VERSION_CONFLICT")) { await sleep(1000); continue; } // 배경 저장으로 rev가 움직인 것 — 재시도
       break;
     }
-    rec("[결함#4 수정 확인] NAS 경로에서도 락 보유 항목 저장 시도가 ITEM_LOCKED로 거부됨",
-      !bSaveAttempt.ok && String(bSaveAttempt.error).includes("ITEM_LOCKED:REQ-LOCK-TEST-L4"),
+    rec("[결함#4+#8 수정 확인] NAS 경로에서도 락 보유 항목 저장 시도가 ITEM_LOCKED로 거부됨",
+      !bSaveAttempt.ok && String(bSaveAttempt.error).includes("ITEM_LOCKED:t_locktest:REQ-LOCK-TEST-L4"),
       JSON.stringify(bSaveAttempt));
 
-    await invokeRaw(pageA, "release_item_lock", { projectPath: SHARED_PATH_FOR_APP, itemId: "REQ-LOCK-TEST-L4", userId: "userA" });
+    await invokeRaw(pageA, "release_item_lock", { projectPath: SHARED_PATH_FOR_APP, itemId: "t_locktest:REQ-LOCK-TEST-L4", userId: "userA" });
     let bRetry = null;
     for (let i = 0; i < 5; i++) {
       const fresh = await invokeRaw(pageA, "read_data", { path: SHARED_PATH_FOR_APP });
