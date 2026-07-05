@@ -43,6 +43,10 @@ import {
   Lock,
   AlignLeft,
   Palette,
+  Bold,
+  Underline,
+  Strikethrough,
+  Type,
 } from "lucide-react";
 import {
   Requirement,
@@ -51,7 +55,16 @@ import {
   Assignee,
   Column,
   ColumnType,
+  TextRun,
 } from "../types";
+import {
+  toggleMark,
+  setColor as rtSetColor,
+  setSize as rtSetSize,
+  clampRuns,
+  toSegments,
+  styleToCss,
+} from "../lib/richText";
 import type { DashboardFilterCommand } from "./StatsCards";
 import { INITIAL_REQUIREMENTS, INITIAL_ASSIGNEES } from "../data";
 import DraggableModal from "./DraggableModal";
@@ -86,6 +99,267 @@ const getTauriInvoke = async () => {
   }
   return null;
 };
+
+/**
+ * 셀 텍스트를 서식 run에 따라 렌더한다. run이 없으면 순수 텍스트 그대로.
+ * 값이 비면 호출부에서 placeholder를 그리도록 null을 반환한다.
+ * (dangerouslySetInnerHTML을 쓰지 않고 span 조각으로 안전하게 렌더 — XSS 없음)
+ */
+function renderRich(text: string, runs?: TextRun[]): React.ReactNode {
+  if (!text) return null;
+  if (!runs || runs.length === 0) return text;
+  const segs = toSegments(text, runs);
+  return segs.map((seg, i) => {
+    const css = styleToCss(seg.style);
+    // 스타일이 없는 조각은 불필요한 span 없이 그대로
+    if (Object.keys(css).length === 0) return <React.Fragment key={i}>{seg.text}</React.Fragment>;
+    return (
+      <span key={i} style={css}>
+        {seg.text}
+      </span>
+    );
+  });
+}
+
+/**
+ * [Phase 2] 셀 텍스트 부분 서식 편집 팝오버.
+ * 셀 텍스트는 읽기 전용으로 보여주고(선택 전용), 드래그로 선택한 구간에 서식을 적용한다.
+ * 텍스트 내용 편집은 기존 셀 편집(textarea)에서 하므로, 여기서는 서식 부가 레이어만 다뤄
+ * 다중 사용자 락/stale 로직과 완전히 격리된다. "적용" 시 onApply(runs)로 richText만 저장.
+ */
+const RT_COLORS: { label: string; value: string | undefined }[] = [
+  { label: "기본", value: undefined },
+  { label: "빨강", value: "#dc2626" },
+  { label: "주황", value: "#ea580c" },
+  { label: "초록", value: "#16a34a" },
+  { label: "파랑", value: "#2563eb" },
+  { label: "보라", value: "#7c3aed" },
+];
+const RT_BASE_SIZE = 14;
+const RT_MIN_SIZE = 10;
+const RT_MAX_SIZE = 40;
+
+function FormatPopover({
+  text,
+  label,
+  initialRuns,
+  onApply,
+  onClose,
+}: {
+  text: string;
+  label: string;
+  initialRuns?: TextRun[];
+  onApply: (runs: TextRun[]) => void;
+  onClose: () => void;
+}) {
+  const [runs, setRuns] = useState<TextRun[]>(initialRuns ?? []);
+  const [sel, setSel] = useState<{ start: number; end: number }>({
+    start: 0,
+    end: 0,
+  });
+  const taRef = useRef<HTMLTextAreaElement | null>(null);
+  const hasSel = sel.end > sel.start;
+
+  const captureSel = () => {
+    const ta = taRef.current;
+    if (!ta) return;
+    setSel({ start: ta.selectionStart, end: ta.selectionEnd });
+  };
+
+  // 서식 적용 시점에 textarea에서 선택 범위를 실시간으로 읽는다(상태 지연/이벤트 누락 방지).
+  const readSel = (): { start: number; end: number } => {
+    const ta = taRef.current;
+    if (ta && ta.selectionEnd > ta.selectionStart) {
+      return { start: ta.selectionStart, end: ta.selectionEnd };
+    }
+    return sel;
+  };
+  const applyToggle = (mark: "bold" | "underline" | "strike") => {
+    const s = readSel();
+    if (s.end <= s.start) return;
+    setRuns((r) => toggleMark(text, r, s.start, s.end, mark));
+  };
+  const applyColor = (color: string | undefined) => {
+    const s = readSel();
+    if (s.end <= s.start) return;
+    setRuns((r) => rtSetColor(text, r, s.start, s.end, color));
+  };
+  const bumpSize = (dir: 1 | -1) => {
+    const s = readSel();
+    if (s.end <= s.start) return;
+    setRuns((r) => {
+      // 선택 시작 문자의 현재 크기(없으면 기본)를 기준으로 증감
+      const cur =
+        r.find((run) => run.size && s.start >= run.start && s.start < run.end)
+          ?.size ?? RT_BASE_SIZE;
+      const next = Math.max(
+        RT_MIN_SIZE,
+        Math.min(RT_MAX_SIZE, cur + dir * 2),
+      );
+      return rtSetSize(text, r, s.start, s.end, next);
+    });
+  };
+
+  const btn =
+    "px-2.5 py-1.5 rounded-md text-[13px] font-semibold border transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed";
+  const btnIdle =
+    "bg-brand-surface-high border-brand-outline-variant text-brand-on-surface hover:bg-brand-surface-highest";
+
+  return createPortal(
+    <div
+      className="fixed inset-0 z-[100] flex items-center justify-center bg-black/40"
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+    >
+      <div className="bg-brand-surface border border-brand-outline-variant rounded-2xl shadow-2xl w-[520px] max-w-[94vw] p-6 animate-fade-in">
+        <div className="flex items-center justify-between mb-3">
+          <div className="flex items-center gap-2 text-brand-on-surface">
+            <Type className="w-5 h-5 text-brand-primary" />
+            <h3 className="text-base font-bold">텍스트 서식 — [{label}]</h3>
+          </div>
+          <button
+            onClick={onClose}
+            className="p-1 rounded-md hover:bg-brand-surface-high text-brand-on-surface-variant cursor-pointer"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+
+        {text ? (
+          <>
+            <p className="text-[12px] text-brand-on-surface-variant mb-2">
+              아래 텍스트에서 서식을 적용할 부분을{" "}
+              <b>드래그로 선택</b>한 뒤 서식 버튼을 누르세요.
+            </p>
+            <textarea
+              ref={taRef}
+              data-testid="rt-selector"
+              value={text}
+              // 내용 편집은 셀 편집기에서만. 여기선 값을 고정(onChange 무시)해 "선택 전용"으로
+              // 쓰되, readOnly가 아니어서 캐럿·키보드 선택이 모든 브라우저에서 정상 동작한다.
+              onChange={() => {}}
+              onSelect={captureSel}
+              onMouseUp={captureSel}
+              onKeyUp={captureSel}
+              onKeyDown={captureSel}
+              className="w-full h-20 mb-1 rounded-lg border border-brand-outline-variant bg-brand-surface-high px-3 py-2 text-sm text-brand-on-surface resize-none focus:outline-none focus:border-brand-primary"
+            />
+            <div className="text-[11px] text-brand-on-surface-variant mb-3 h-4">
+              {hasSel
+                ? `선택: ${sel.end - sel.start}자 (${sel.start}~${sel.end})`
+                : "선택된 텍스트가 없습니다."}
+            </div>
+
+            {/* 서식 툴바 */}
+            <div className="flex flex-wrap items-center gap-1.5 mb-3">
+              <button
+                className={`${btn} ${btnIdle}`}
+                disabled={!hasSel}
+                onClick={() => applyToggle("bold")}
+                title="굵게"
+              >
+                <Bold className="w-4 h-4" />
+              </button>
+              <button
+                className={`${btn} ${btnIdle}`}
+                disabled={!hasSel}
+                onClick={() => applyToggle("underline")}
+                title="밑줄"
+              >
+                <Underline className="w-4 h-4" />
+              </button>
+              <button
+                className={`${btn} ${btnIdle}`}
+                disabled={!hasSel}
+                onClick={() => applyToggle("strike")}
+                title="취소선"
+              >
+                <Strikethrough className="w-4 h-4" />
+              </button>
+              <div className="w-[1px] h-6 bg-brand-outline-variant mx-1" />
+              <button
+                className={`${btn} ${btnIdle}`}
+                disabled={!hasSel}
+                onClick={() => bumpSize(-1)}
+                title="크기 축소"
+              >
+                <span className="text-[11px]">A-</span>
+              </button>
+              <button
+                className={`${btn} ${btnIdle}`}
+                disabled={!hasSel}
+                onClick={() => bumpSize(1)}
+                title="크기 확대"
+              >
+                <span className="text-[15px]">A+</span>
+              </button>
+              <div className="w-[1px] h-6 bg-brand-outline-variant mx-1" />
+              {RT_COLORS.map((c) => (
+                <button
+                  key={c.label}
+                  className={`w-6 h-6 rounded-md border cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed ${c.value ? "" : "bg-brand-surface-high"} border-brand-outline-variant flex items-center justify-center`}
+                  style={c.value ? { backgroundColor: c.value } : undefined}
+                  disabled={!hasSel}
+                  onClick={() => applyColor(c.value)}
+                  title={c.label === "기본" ? "색상 제거" : c.label}
+                >
+                  {c.label === "기본" && (
+                    <X className="w-3 h-3 text-brand-on-surface-variant" />
+                  )}
+                </button>
+              ))}
+            </div>
+
+            {/* 미리보기 */}
+            <div className="mb-4">
+              <div className="text-[11px] text-brand-on-surface-variant mb-1">
+                미리보기
+              </div>
+              <div className="min-h-[2.5rem] rounded-lg border border-brand-outline-variant bg-brand-surface-lowest px-3 py-2 text-sm text-brand-on-surface whitespace-pre-wrap break-words">
+                {renderRich(text, runs)}
+              </div>
+            </div>
+          </>
+        ) : (
+          <p className="text-[13px] text-brand-on-surface-variant mb-4 py-6 text-center">
+            이 셀에는 서식을 적용할 텍스트가 없습니다. 먼저 셀에 내용을 입력해 주세요.
+          </p>
+        )}
+
+        <div className="flex justify-between items-center">
+          <button
+            onClick={() => setRuns([])}
+            disabled={!text || runs.length === 0}
+            className={`${btn} ${btnIdle}`}
+            title="모든 서식 지우기"
+          >
+            서식 전체 지우기
+          </button>
+          <div className="flex gap-2">
+            <button
+              onClick={onClose}
+              className="px-4 py-2 rounded-lg text-[13px] font-semibold bg-brand-surface-high border border-brand-outline-variant text-brand-on-surface hover:bg-brand-surface-highest cursor-pointer"
+            >
+              취소
+            </button>
+            <button
+              onClick={() => {
+                onApply(runs);
+                onClose();
+              }}
+              disabled={!text}
+              className="px-4 py-2 rounded-lg text-[13px] font-semibold bg-brand-primary text-brand-on-primary hover:opacity-90 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              적용
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>,
+    document.body,
+  );
+}
 
 export default function Spreadsheet({
   activeTabId,
@@ -534,6 +808,12 @@ export default function Spreadsheet({
   const [lockLost, setLockLost] = useState(false);
   // [UX-2] stale 충돌 시 선택 모달: 내 입력 vs 상대 최신값 중 무엇을 남길지 사용자에게.
   const [staleEdit, setStaleEdit] = useState<{ rowId: string; field: string; fieldLabel: string; myValue: any; currentValue: any } | null>(null);
+  // [Phase 2] 셀 텍스트 부분 서식 편집 팝오버 대상(셀 우클릭으로 진입). null이면 닫힘.
+  const [formatTarget, setFormatTarget] = useState<{
+    rowId: string;
+    field: string;
+    label: string;
+  } | null>(null);
 
   useEffect(() => {
     cellRef.current = activeCellEditor;
@@ -1061,14 +1341,61 @@ export default function Spreadsheet({
               }
               return { ...req, id: value };
             }
-            if (field === "title") return { ...req, title: value };
+            if (field === "title")
+              return {
+                ...req,
+                title: value,
+                ...clampRichTextField(req, "title", value),
+              };
             if (field === "priority") return { ...req, priority: value as Priority };
             if (field === "status") return { ...req, status: value as Status };
             if (field === "dueDate") return { ...req, dueDate: value };
             const updatedCustom = { ...req.customColumns, [field]: value };
-            return { ...req, customColumns: updatedCustom };
+            return {
+              ...req,
+              customColumns: updatedCustom,
+              ...clampRichTextField(req, field, value),
+            };
           }
           return req;
+        }),
+      );
+    },
+    [setRequirements],
+  );
+
+  // 텍스트가 바뀌면 해당 필드의 서식 run을 새 길이로 클램프한 richText 패치를 만든다.
+  // (서식은 부가 레이어이므로, 편집으로 offset이 어긋나도 데이터는 안전하게 유지)
+  const clampRichTextField = (
+    req: Requirement,
+    field: string,
+    value: any,
+  ): Partial<Requirement> => {
+    const existing = req.richText?.[field];
+    if (!existing) return {};
+    const clamped = clampRuns(existing, String(value ?? "").length);
+    const nextRich = { ...req.richText };
+    if (clamped) nextRich[field] = clamped;
+    else delete nextRich[field];
+    return {
+      richText: Object.keys(nextRich).length ? nextRich : undefined,
+    };
+  };
+
+  // [Phase 2] 셀 텍스트 부분 서식(run) 저장. 서식 팝오버의 "적용"에서 호출.
+  // 텍스트 정본은 건드리지 않고 richText 부가 레이어만 갱신한다.
+  const updateRichText = useCallback(
+    (rowId: string, field: string, runs: TextRun[]) => {
+      setRequirements((prev) =>
+        prev.map((req) => {
+          if (req.id !== rowId) return req;
+          const nextRich = { ...req.richText };
+          if (runs && runs.length) nextRich[field] = runs;
+          else delete nextRich[field];
+          return {
+            ...req,
+            richText: Object.keys(nextRich).length ? nextRich : undefined,
+          };
         }),
       );
     },
@@ -2090,6 +2417,10 @@ export default function Spreadsheet({
       )
         return; // Fallback to normal if just text
 
+      // 자유 텍스트 셀의 들여쓰기(줄 앞 공백/탭)를 보존한다.
+      // 셀 경계에서 생기는 우발적 \r과 후행 개행만 정리하고, 앞뒤 공백은 남긴다.
+      const preserveIndent = (s: string) => s.replace(/\r/g, "").replace(/\n+$/, "");
+
       const startRowIndex = filteredAndSortedRequirements.findIndex(
         (r) => r.id === startRowId,
       );
@@ -2147,11 +2478,12 @@ export default function Spreadsheet({
           rowData.forEach((cellText, j) => {
             const targetColIndex = startColIndex + j;
             if (targetColIndex >= usableCols.length) return;
-            const colId = usableCols[targetColIndex].id;
+            const targetCol = usableCols[targetColIndex];
+            const colId = targetCol.id;
 
             const cleanedText = cellText.trim();
 
-            if (colId === "title") currentReq.title = cleanedText;
+            if (colId === "title") currentReq.title = preserveIndent(cellText);
             else if (colId === "priority") {
               const up = cleanedText.toUpperCase() as Priority;
               if (["HIGH", "MEDIUM", "LOW"].includes(up))
@@ -2194,8 +2526,12 @@ export default function Spreadsheet({
               if (matchedAssignees.length > 0) {
                 currentReq.assignees = matchedAssignees;
               }
-            } else if (usableCols[targetColIndex].isCustom) {
-              currentReq.customColumns[colId] = cleanedText;
+            } else if (targetCol.isCustom) {
+              // 텍스트형 커스텀 컬럼은 들여쓰기 보존, 숫자 등 계산형은 trim 유지
+              const isTextual = !targetCol.type || targetCol.type === "text";
+              currentReq.customColumns[colId] = isTextual
+                ? preserveIndent(cellText)
+                : cleanedText;
             }
           });
 
@@ -2346,6 +2682,28 @@ export default function Spreadsheet({
           </div>,
           document.body,
         )}
+
+      {/* [Phase 2] 셀 텍스트 부분 서식 편집 팝오버 (셀 우클릭으로 진입) */}
+      {formatTarget &&
+        (() => {
+          const req = reqByIdRef.current.get(formatTarget.rowId);
+          if (!req) return null;
+          const value =
+            formatTarget.field === "title"
+              ? req.title
+              : req.customColumns?.[formatTarget.field] ?? "";
+          return (
+            <FormatPopover
+              text={String(value ?? "")}
+              label={formatTarget.label}
+              initialRuns={req.richText?.[formatTarget.field]}
+              onApply={(runs) =>
+                updateRichText(formatTarget.rowId, formatTarget.field, runs)
+              }
+              onClose={() => setFormatTarget(null)}
+            />
+          );
+        })()}
 
       {/* 1. SpreadSheet Toolbar */}
       <div className="px-5 py-4 border-b border-brand-outline-variant bg-brand-surface-low flex flex-col sm:flex-row justify-between items-center gap-4">
@@ -2955,6 +3313,7 @@ export default function Spreadsheet({
                           setMinimizedColumns={setMinimizedColumns}
                           setActiveCellEditor={setActiveCellEditor}
                           updateRequirementField={updateRequirementField}
+                          setFormatTarget={setFormatTarget}
                           handleGridPaste={handleGridPaste}
                           setShowPriorityDropdownId={setShowPriorityDropdownId}
                           setPriorityDropdownPos={setPriorityDropdownPos}
@@ -5204,6 +5563,7 @@ const SpreadsheetRow = React.memo(
       setMinimizedColumns,
       setActiveCellEditor,
       updateRequirementField,
+      setFormatTarget,
       handleGridPaste,
       setShowPriorityDropdownId,
       setPriorityDropdownPos,
@@ -5428,6 +5788,7 @@ const SpreadsheetRow = React.memo(
               <td
                 key={col.id}
                 style={cellStyle}
+                data-format-field="title"
                 onClick={() => {
                   if (isLockedByOther) {
                     alert(
@@ -5436,6 +5797,15 @@ const SpreadsheetRow = React.memo(
                     return;
                   }
                   setActiveCellEditor({ rowId: req.id, field: "title" });
+                }}
+                onContextMenu={(e) => {
+                  if (isLockedByOther) return;
+                  e.preventDefault();
+                  setFormatTarget({
+                    rowId: req.id,
+                    field: "title",
+                    label: "제목",
+                  });
                 }}
                 className={`px-2 py-1 border-r border-brand-outline-variant duration-300 ${isLockedByOther ? "cursor-not-allowed bg-brand-surface-high/30" : "cursor-text hover:bg-brand-surface-high/20"} transition-colors ${truncateClass} align-top relative ${shadowClass}`}
                 title={
@@ -5474,9 +5844,13 @@ const SpreadsheetRow = React.memo(
                   />
                 )}
                 <div
-                  className={`font-medium min-h-[1.2rem] ${isEditing ? "opacity-0" : ""}`}
+                  className={`font-medium min-h-[1.2rem] ${truncateClass} ${isEditing ? "opacity-0" : ""}`}
                 >
-                  {req.title || <span className="opacity-0">-</span>}
+                  {req.title ? (
+                    renderRich(req.title, req.richText?.title)
+                  ) : (
+                    <span className="opacity-0">-</span>
+                  )}
                 </div>
               </td>
             );
@@ -6451,8 +6825,21 @@ const SpreadsheetRow = React.memo(
               <td
                 key={col.id}
                 style={cellStyle}
+                data-format-field={inputType === "text" ? col.id : undefined}
                 onClick={() =>
                   setActiveCellEditor({ rowId: req.id, field: col.id })
+                }
+                onContextMenu={
+                  inputType === "text"
+                    ? (e) => {
+                        e.preventDefault();
+                        setFormatTarget({
+                          rowId: req.id,
+                          field: col.id,
+                          label: col.label,
+                        });
+                      }
+                    : undefined
                 }
                 className={`px-2 py-1 border-r border-brand-outline-variant cursor-text hover:bg-brand-surface-high/20 transition-colors align-top relative ${shadowClass}`}
               >
@@ -6487,7 +6874,9 @@ const SpreadsheetRow = React.memo(
                   cellVal &&
                   !isNaN(Number(cellVal))
                     ? Number(cellVal).toFixed(col.decimalPlaces)
-                    : cellVal || <span className="opacity-0">-</span>}
+                    : cellVal
+                      ? renderRich(cellVal, req.richText?.[col.id])
+                      : <span className="opacity-0">-</span>}
                 </div>
               </td>
             );
